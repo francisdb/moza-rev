@@ -1,6 +1,48 @@
 # moza-rev
 Control the moza race wheel rev meter with game telemetry
 
+## Usage
+
+### Prerequisites
+
+- Rust (stable, 2024 edition).
+- `libudev` development headers (`sudo dnf install systemd-devel` on Fedora, `sudo apt install libudev-dev` on Debian/Ubuntu).
+- Read/write access to the Moza serial device. On most distros the wheelbase shows up under `/dev/ttyACM*` and `/dev/serial/by-id/usb-Gudsen_MOZA_*`. If you get a permission denied opening it, add yourself to the `dialout` group (or `uucp` on Arch) and re-login: `sudo usermod -aG dialout $USER`.
+
+### Build
+
+```sh
+cargo build --release
+```
+
+### Run
+
+Default: listen for Wreckfest 2 telemetry on UDP `:23123`, autodetect the Moza wheelbase, drive the LEDs.
+
+```sh
+cargo run --release
+```
+
+Useful flags:
+
+```sh
+cargo run --release -- --port 23123          # change UDP port
+cargo run --release -- --serial /dev/ttyACM0 # override the autodetected serial path
+cargo run --release -- --leds 10             # number of LEDs on the wheel (default 10)
+cargo run --release -- --protocol legacy     # force legacy (R3/R5/ES); modern is default for everything else
+cargo run --release -- --verbose             # log every UDP packet's RPM
+```
+
+### Diagnostic examples
+
+```sh
+cargo run --example led_chase    # visual chase pattern; confirms LED writes work
+cargo run --example blast 1023   # full bar at sustained rate; sanity-check the wire
+cargo run --example logcat       # dump every protocol frame seen on the bus
+cargo run --example diagnose     # probe wheel settings (RPM mode, indicator mode, etc.)
+cargo run --example wf2_log      # log a one-line summary per Wreckfest 2 telemetry packet
+```
+
 ## Tested devices
 
 - Moza R5 Bundle (R5 base + bundled ES wheel) — confirmed working
