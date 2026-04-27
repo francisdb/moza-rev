@@ -1,6 +1,12 @@
 # moza-rev
 Control the moza race wheel rev meter with game telemetry
 
+## Tested devices
+
+- Moza R5 Bundle (R5 base + bundled ES wheel) — confirmed working
+
+Other Moza wheelbases should work via the modern protocol path (auto-selected from the USB serial id), but haven't been verified. Reports welcome.
+
 ## Supported games
 
 ### Wreckfest 2
