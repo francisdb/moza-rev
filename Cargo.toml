@@ -1,0 +1,9 @@
+[package]
+name = "moza-rev"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serialport = "4.9"
+log = "0.4"
+env_logger = "0.11"
