@@ -39,6 +39,9 @@ const CHECKSUM_MAGIC: u8 = 0x0D;
 pub const GROUP_WHEEL_READ: u8 = 0x40;
 pub const GROUP_WHEEL_WRITE: u8 = 0x3F;
 const GROUP_BASE_TELEMETRY: u8 = 0x41;
+/// Read-only group for the base's runtime telemetry (temps, state). Boxflat
+/// catalogs these as `read: 43` (= 0x2B) with `write: -1`.
+const GROUP_BASE_TELEM_READ: u8 = 0x2B;
 const BAUD_RATE: u32 = 115200;
 
 /// Wheel device id (decimal 23 in boxflat's `serial.yml`). Used for the
@@ -54,6 +57,16 @@ pub const DEVICE_BASE: u8 = 0x13;
 /// 1 = driven by telemetry frames, 2 = always off, 3 = always on.
 const GROUP_BASE_SETTING_WRITE: u8 = 0x40;
 const ES_INDICATOR_MODE_TELEMETRY: u8 = 1;
+
+/// Wheelbase runtime temperatures (degrees Celsius). Each is `None` if the
+/// underlying read timed out — sensors are independent so partial results
+/// are common when the bus is busy.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct BaseTemps {
+    pub mcu_c: Option<f32>,
+    pub mosfet_c: Option<f32>,
+    pub motor_c: Option<f32>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
@@ -120,6 +133,44 @@ impl Moza {
             ))?;
         }
         Ok(moza)
+    }
+
+    /// Read MCU / MOSFET / motor temperatures from the wheelbase, in degrees
+    /// Celsius. Each value is `None` if its individual read timed out within
+    /// `per_read_deadline`. The wire format is centidegrees (e.g. 0x0E10 =
+    /// 3600 = 36.00 °C).
+    pub fn read_base_temps(&mut self, per_read_deadline: Duration) -> io::Result<BaseTemps> {
+        Ok(BaseTemps {
+            mcu_c: self.read_centidegrees(0x04, per_read_deadline)?,
+            mosfet_c: self.read_centidegrees(0x05, per_read_deadline)?,
+            motor_c: self.read_centidegrees(0x06, per_read_deadline)?,
+        })
+    }
+
+    fn read_centidegrees(&mut self, cmd: u8, deadline: Duration) -> io::Result<Option<f32>> {
+        // Match boxflat's exact wire bytes: `7e:03:2b:13:cmd:00:01:chk`. The
+        // trailing `01` byte is what the firmware expects as a "read 1 value"
+        // marker; sending all-zeros there gets ignored.
+        self.write_frame(&build_frame(
+            GROUP_BASE_TELEM_READ,
+            DEVICE_BASE,
+            &[cmd],
+            &[0x00, 0x01],
+        ))?;
+        let want_group = GROUP_BASE_TELEM_READ | 0x80;
+        let start = Instant::now();
+        while start.elapsed() < deadline {
+            let remaining = deadline.saturating_sub(start.elapsed());
+            let Some(frame) = self.read_frame(remaining)? else {
+                return Ok(None);
+            };
+            if frame.group != want_group || frame.payload.len() < 3 || frame.payload[0] != cmd {
+                continue;
+            }
+            let raw = u16::from_be_bytes([frame.payload[1], frame.payload[2]]);
+            return Ok(Some(raw as f32 / 100.0));
+        }
+        Ok(None)
     }
 
     pub fn send_rpm_bitmask(&mut self, bitmask: u32, led_count: usize) -> io::Result<()> {

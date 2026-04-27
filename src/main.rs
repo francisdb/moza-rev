@@ -1,18 +1,34 @@
 use std::env;
+use std::io;
 use std::io::Write;
 use std::net::UdpSocket;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use log::{error, info};
+use log::{debug, error, info, warn};
 
-use moza_rev::moza::{self, Moza, Protocol};
+use moza_rev::moza::{self, BaseTemps, Moza, Protocol};
 use moza_rev::wreckfest::{self, EngineState};
 
 const DEFAULT_PORT: u16 = 23123;
 const DEFAULT_LED_COUNT: usize = 10;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
 const STATUS_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How often to read the wheelbase temperature sensors.
+const TEMP_POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// Per-sensor read timeout. Each `read_base_temps` call does three sequential
+/// reads, so worst-case wall time is 3x this if all sensors fail to respond.
+const TEMP_READ_DEADLINE: Duration = Duration::from_millis(300);
+/// `recv` timeout so the loop wakes up periodically to do thermal polling
+/// even when no UDP packets are arriving (e.g. game paused, in menu).
+const RECV_TIMEOUT: Duration = Duration::from_millis(250);
+
+// Approximate "elevated" thresholds. Moza firmware auto-protects somewhere
+// above these; the goal is to surface unusual heat well before that fires.
+const MCU_TEMP_WARN_C: f32 = 75.0;
+const MOSFET_TEMP_WARN_C: f32 = 70.0;
+const MOTOR_TEMP_WARN_C: f32 = 95.0;
 
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -58,15 +74,31 @@ fn main() -> ExitCode {
         }
     };
 
+    if let Err(e) = socket.set_read_timeout(Some(RECV_TIMEOUT)) {
+        error!("set socket read timeout: {e}");
+        return ExitCode::FAILURE;
+    }
+
     let mut buf = vec![0u8; 2048];
     let mut last_bitmask: Option<u32> = None;
     let mut last_send = Instant::now();
     let mut last_status = Instant::now();
+    let mut last_temp_poll = Instant::now() - TEMP_POLL_INTERVAL; // poll once on startup
     let mut packets_since_status: u32 = 0;
 
     loop {
+        if last_temp_poll.elapsed() >= TEMP_POLL_INTERVAL {
+            poll_temps(&mut wheel);
+            last_temp_poll = Instant::now();
+        }
+
         let n = match socket.recv(&mut buf) {
             Ok(n) => n,
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
             Err(e) => {
                 error!("recv: {e}");
                 continue;
@@ -105,6 +137,41 @@ fn main() -> ExitCode {
             packets_since_status = 0;
         }
     }
+}
+
+fn poll_temps(wheel: &mut Moza) {
+    match wheel.read_base_temps(TEMP_READ_DEADLINE) {
+        Ok(t) => log_temps(&t),
+        Err(e) => debug!("temp read failed: {e}"),
+    }
+}
+
+fn log_temps(t: &BaseTemps) {
+    debug!(
+        "temps  MCU={} MOSFET={} motor={}",
+        fmt_temp(t.mcu_c),
+        fmt_temp(t.mosfet_c),
+        fmt_temp(t.motor_c)
+    );
+    if let Some(c) = t.mcu_c
+        && c >= MCU_TEMP_WARN_C
+    {
+        warn!("MCU temp elevated: {c:.1}°C (>= {MCU_TEMP_WARN_C:.0}°C)");
+    }
+    if let Some(c) = t.mosfet_c
+        && c >= MOSFET_TEMP_WARN_C
+    {
+        warn!("MOSFET temp elevated: {c:.1}°C (>= {MOSFET_TEMP_WARN_C:.0}°C)");
+    }
+    if let Some(c) = t.motor_c
+        && c >= MOTOR_TEMP_WARN_C
+    {
+        warn!("motor temp elevated: {c:.1}°C (>= {MOTOR_TEMP_WARN_C:.0}°C)");
+    }
+}
+
+fn fmt_temp(t: Option<f32>) -> String {
+    t.map_or_else(|| "?".to_string(), |c| format!("{c:.1}°C"))
 }
 
 fn print_status(engine: &EngineState, bitmask: u32, led_count: usize, packets: u32, verbose: bool) {
