@@ -33,3 +33,9 @@ RUST_LOG=moza_rev=trace cargo run       # trace only the moza-rev crate, leave d
 ```
 
 `logcat` dumps every received frame at `info` (its job is to surface them); other binaries keep per-frame output at `debug`.
+
+## Related projects
+
+- [Lawstorant/boxflat](https://github.com/Lawstorant/boxflat) — Moza wheel/base/pedal control GUI for Linux. Reference implementation for the Moza serial protocol; this project's wire format and addressing were validated by capturing and matching boxflat's output byte-for-byte.
+- [PHARTGAMES/SpaceMonkey](https://github.com/PHARTGAMES/SpaceMonkey) — multi-game telemetry tool that supports games without native UDP output (including Wreckfest 1) by reading game memory. Windows-only and uses memory injection, so it's the obvious bridge if you want LEDs in a game that doesn't expose telemetry over UDP.
+- [PHARTGAMES/WreckfestSimFeedback](https://github.com/PHARTGAMES/WreckfestSimFeedback) — SimFeedback motion-telemetry provider for Wreckfest, also from PHARTGAMES.
