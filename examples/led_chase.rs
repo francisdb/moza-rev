@@ -43,7 +43,9 @@ fn main() -> ExitCode {
             }
             "--serial" => serial_override = it.next(),
             "--help" | "-h" => {
-                eprintln!("usage: led_chase [--leds N] [--step-ms MS] [--protocol modern|legacy] [--serial PATH]");
+                eprintln!(
+                    "usage: led_chase [--leds N] [--step-ms MS] [--protocol modern|legacy] [--serial PATH]"
+                );
                 return ExitCode::SUCCESS;
             }
             other => eprintln!("ignoring unknown argument: {other}"),

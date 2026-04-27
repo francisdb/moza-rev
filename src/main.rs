@@ -46,7 +46,9 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let protocol = args.protocol.unwrap_or_else(|| moza::detect_protocol(&serial_path));
+    let protocol = args
+        .protocol
+        .unwrap_or_else(|| moza::detect_protocol(&serial_path));
     info!("opening Moza wheelbase at {serial_path} ({protocol:?} protocol)");
     let mut wheel = match Moza::open(&serial_path, protocol) {
         Ok(m) => m,
@@ -92,7 +94,13 @@ fn main() -> ExitCode {
             print_status(&engine, bitmask, args.led_count, packets_since_status, true);
             packets_since_status = 0;
         } else if last_status.elapsed() >= STATUS_INTERVAL {
-            print_status(&engine, bitmask, args.led_count, packets_since_status, false);
+            print_status(
+                &engine,
+                bitmask,
+                args.led_count,
+                packets_since_status,
+                false,
+            );
             last_status = Instant::now();
             packets_since_status = 0;
         }
@@ -116,7 +124,13 @@ fn print_status(engine: &EngineState, bitmask: u32, led_count: usize, packets: u
 
 fn led_bar(bitmask: u32, led_count: usize) -> String {
     (0..led_count)
-        .map(|i| if bitmask & (1 << i) != 0 { '●' } else { '○' })
+        .map(|i| {
+            if bitmask & (1 << i) != 0 {
+                '●'
+            } else {
+                '○'
+            }
+        })
         .collect()
 }
 
@@ -173,7 +187,11 @@ impl Args {
                     protocol = Some(match v.as_str() {
                         "modern" | "new" => Protocol::Modern,
                         "legacy" | "old" | "es" => Protocol::Legacy,
-                        other => return Err(format!("invalid protocol (expected modern|legacy): {other}")),
+                        other => {
+                            return Err(format!(
+                                "invalid protocol (expected modern|legacy): {other}"
+                            ));
+                        }
                     });
                 }
                 "--verbose" | "-v" => {

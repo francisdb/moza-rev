@@ -17,7 +17,7 @@ use std::env;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use moza_rev::moza::{self, Moza, Protocol, GROUP_WHEEL_READ};
+use moza_rev::moza::{self, GROUP_WHEEL_READ, Moza, Protocol};
 
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -64,26 +64,43 @@ fn main() -> ExitCode {
     let deadline = Duration::from_millis(800);
 
     println!();
-    read_one(&mut wheel, "rpm-indicator-mode", &[0x04], 1, deadline, |v| {
-        match v {
+    read_one(
+        &mut wheel,
+        "rpm-indicator-mode",
+        &[0x04],
+        1,
+        deadline,
+        |v| match v {
             1 => "RPM (telemetry-driven)".to_string(),
             2 => "Off".to_string(),
             3 => "On (demo / always lit)".to_string(),
             other => format!("unknown ({other})"),
-        }
-    });
-    read_one(&mut wheel, "rpm-mode (es)", &[0x17], 1, deadline, |v| match v {
-        0 => "Percent".to_string(),
-        1 => "RPM".to_string(),
-        other => format!("unknown ({other})"),
-    });
-    read_one(&mut wheel, "rpm-display-mode", &[0x08], 1, deadline, |v| {
-        match v {
+        },
+    );
+    read_one(
+        &mut wheel,
+        "rpm-mode (es)",
+        &[0x17],
+        1,
+        deadline,
+        |v| match v {
+            0 => "Percent".to_string(),
+            1 => "RPM".to_string(),
+            other => format!("unknown ({other})"),
+        },
+    );
+    read_one(
+        &mut wheel,
+        "rpm-display-mode",
+        &[0x08],
+        1,
+        deadline,
+        |v| match v {
             1 => "Mode 1".to_string(),
             2 => "Mode 2".to_string(),
             other => format!("unknown ({other})"),
-        }
-    });
+        },
+    );
     read_one(
         &mut wheel,
         "rpm-brightness (es)",

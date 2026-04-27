@@ -263,7 +263,11 @@ impl Moza {
                 "← group=0x{group:02X} device=0x{device:02X} payload={}",
                 hex(&payload)
             );
-            return Ok(Some(Frame { group, device, payload }));
+            return Ok(Some(Frame {
+                group,
+                device,
+                payload,
+            }));
         }
     }
 }
@@ -277,7 +281,7 @@ pub struct Frame {
 
 #[allow(dead_code)]
 fn swap_nibbles(b: u8) -> u8 {
-    (b << 4) | (b >> 4)
+    b.rotate_right(4)
 }
 
 /// Find the wheelbase serial port via /dev/serial/by-id/. Moza devices have
@@ -389,13 +393,19 @@ mod tests {
     #[test]
     fn modern_rpm_frame_no_leds_lit() {
         let frame = build_modern_rpm_frame(DEVICE_WHEEL, 0, 10);
-        assert_eq!(frame, vec![0x7E, 0x04, 0x3F, 0x17, 0x1A, 0x00, 0x00, 0x00, 0xFF]);
+        assert_eq!(
+            frame,
+            vec![0x7E, 0x04, 0x3F, 0x17, 0x1A, 0x00, 0x00, 0x00, 0xFF]
+        );
     }
 
     #[test]
     fn modern_rpm_frame_all_10_lit() {
         let frame = build_modern_rpm_frame(DEVICE_WHEEL, 0x03FF, 10);
-        assert_eq!(frame, vec![0x7E, 0x04, 0x3F, 0x17, 0x1A, 0x00, 0xFF, 0x03, 0x01]);
+        assert_eq!(
+            frame,
+            vec![0x7E, 0x04, 0x3F, 0x17, 0x1A, 0x00, 0xFF, 0x03, 0x01]
+        );
     }
 
     #[test]
@@ -411,7 +421,9 @@ mod tests {
         let frame = build_legacy_rpm_frame(DEVICE_BASE, 0x03FF);
         assert_eq!(
             frame,
-            vec![0x7E, 0x06, 0x41, 0x13, 0xFD, 0xDE, 0x00, 0x00, 0x03, 0xFF, 0xC2]
+            vec![
+                0x7E, 0x06, 0x41, 0x13, 0xFD, 0xDE, 0x00, 0x00, 0x03, 0xFF, 0xC2
+            ]
         );
     }
 
@@ -421,7 +433,9 @@ mod tests {
         let frame = build_legacy_rpm_frame(DEVICE_BASE, 0);
         assert_eq!(
             frame,
-            vec![0x7E, 0x06, 0x41, 0x13, 0xFD, 0xDE, 0x00, 0x00, 0x00, 0x00, 0xC0]
+            vec![
+                0x7E, 0x06, 0x41, 0x13, 0xFD, 0xDE, 0x00, 0x00, 0x00, 0x00, 0xC0
+            ]
         );
     }
 
