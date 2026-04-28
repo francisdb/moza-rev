@@ -5,9 +5,10 @@
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, Write};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -16,6 +17,9 @@ const WF2_APP_ID: &str = "1203190";
 const DR2_APP_ID: &str = "690790";
 const DIRT_SHOWDOWN_APP_ID: &str = "201700";
 const BEAMNG_APP_ID: &str = "284160";
+const AMS2_APP_ID: &str = "1066890";
+
+const AMS2_DEFAULT_PORT: u16 = 5606;
 
 /// Detect-only — these run on EGO/proprietary engines without native UDP
 /// telemetry; the only path is memory injection (SpaceMonkey on Windows).
@@ -53,15 +57,6 @@ const MANUAL_TELEMETRY_GAMES: &[ManualEntry] = &[
         notes: "  Has UDP remote telemetry (same format as base Assetto Corsa).\n  \
                 Some fields are not yet populated in early access.\n  \
                 moza-rev does not yet have an AC-family parser.",
-    },
-    ManualEntry {
-        app_id: "1066890",
-        name: "Automobilista 2",
-        notes: "  Has UDP telemetry on port 5606 using the Project CARS 2 format.\n  \
-                In game: Options → System → UDP Protocol Version: Project CARS 2,\n  \
-                                          Shared Memory: Project CARS 2,\n  \
-                                          UDP Frequency: 1+\n  \
-                moza-rev does not yet have a Madness-engine parser.",
     },
 ];
 
@@ -128,6 +123,10 @@ pub fn run() -> ExitCode {
         if let Err(e) = handle_dr2_style("DiRT Showdown", DIRT_SHOWDOWN_APP_ID, "DiRT Showdown") {
             eprintln!("DiRT Showdown: error: {e}\n");
         }
+    }
+    if game_installed(AMS2_APP_ID) {
+        any_handled = true;
+        handle_ams2();
     }
     if game_installed(BEAMNG_APP_ID) {
         any_handled = true;
@@ -375,6 +374,110 @@ fn rewrite_xml_attrs(element: &str, updates: &[(&str, &str)]) -> String {
         }
     }
     out
+}
+
+//
+// Automobilista 2 / Project CARS 2 — encrypted .sav, can't auto-edit
+//
+// We can still actively probe whether the host's broadcast-loopback
+// quirk has been worked around: send a magic UDP packet to the limited
+// broadcast address, see if our local listener receives it back.
+//
+
+fn handle_ams2() {
+    println!("Automobilista 2");
+    println!("  Has UDP telemetry on port {AMS2_DEFAULT_PORT} using the Project CARS 2 format.");
+    println!("  In game: Options → System → UDP Protocol Version: Project CARS 2,");
+    println!("                              UDP Frequency: 1+");
+    println!("  (Settings live in encrypted .sav files; can't auto-edit.)");
+
+    match probe_broadcast_loopback(AMS2_DEFAULT_PORT) {
+        ProbeResult::LoopbackWorks => {
+            println!(
+                "  ✓ broadcast loopback works on port {AMS2_DEFAULT_PORT} — game traffic will reach moza-rev."
+            );
+        }
+        ProbeResult::NoLoopback => {
+            println!(
+                "  ⚠ broadcast loopback NOT working on port {AMS2_DEFAULT_PORT} — game traffic won't reach moza-rev."
+            );
+            println!(
+                "    Linux doesn't loop limited-broadcast (255.255.255.255) to local sockets."
+            );
+            println!("    Apply this iptables NAT redirect (one-time, reversible with -D):");
+            println!(
+                "      sudo iptables -t nat -I OUTPUT -p udp -d 255.255.255.255 --dport {AMS2_DEFAULT_PORT} \\"
+            );
+            println!("        -j DNAT --to-destination 127.0.0.1:{AMS2_DEFAULT_PORT}");
+        }
+        ProbeResult::CouldNotProbe(reason) => {
+            println!("  Couldn't check broadcast loopback: {reason}");
+        }
+    }
+    println!();
+}
+
+/// Result of [`probe_broadcast_loopback`].
+enum ProbeResult {
+    /// A magic UDP packet sent to `255.255.255.255:port` was received
+    /// back by a local listener on `port`. Either the iptables NAT
+    /// redirect is in place, or some other mechanism is looping the
+    /// broadcast back. Either way, AMS2 will reach our listener.
+    LoopbackWorks,
+    /// The probe ran but nothing came back within the timeout — the
+    /// kernel is dropping the locally-emitted broadcast.
+    NoLoopback,
+    /// We couldn't run the probe at all (port already bound, no
+    /// broadcast-routable interface, etc.).
+    CouldNotProbe(String),
+}
+
+/// Send one magic packet to the limited-broadcast address on `port` and
+/// see if a local listener bound to `0.0.0.0:port` picks it up. Doesn't
+/// require root. Filters by a unique magic payload so concurrent traffic
+/// (an actually-running game) doesn't confuse the result.
+fn probe_broadcast_loopback(port: u16) -> ProbeResult {
+    const PROBE_MAGIC: &[u8] = b"moza-rev-loopback-probe-v1";
+    const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
+    let listener_addr = SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), port);
+    let listener = match UdpSocket::bind(listener_addr) {
+        Ok(s) => s,
+        Err(e) => {
+            return ProbeResult::CouldNotProbe(format!(
+                "couldn't bind 0.0.0.0:{port} ({e}); is moza-rev or another listener running?"
+            ));
+        }
+    };
+    if let Err(e) = listener.set_read_timeout(Some(PROBE_TIMEOUT)) {
+        return ProbeResult::CouldNotProbe(format!("set_read_timeout: {e}"));
+    }
+
+    let sender = match UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0)) {
+        Ok(s) => s,
+        Err(e) => return ProbeResult::CouldNotProbe(format!("can't open sender socket: {e}")),
+    };
+    if let Err(e) = sender.set_broadcast(true) {
+        return ProbeResult::CouldNotProbe(format!("set_broadcast: {e}"));
+    }
+
+    let dest = SocketAddrV4::new(Ipv4Addr::BROADCAST, port);
+    if let Err(e) = sender.send_to(PROBE_MAGIC, dest) {
+        return ProbeResult::CouldNotProbe(format!("send broadcast probe: {e}"));
+    }
+
+    // Drain the listener for the timeout window, ignoring anything that
+    // isn't our magic (in case the game is actively broadcasting).
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    let mut buf = [0u8; 2048];
+    while Instant::now() < deadline {
+        match listener.recv(&mut buf) {
+            Ok(n) if &buf[..n] == PROBE_MAGIC => return ProbeResult::LoopbackWorks,
+            Ok(_) => {} // some other packet — keep waiting
+            Err(_) => return ProbeResult::NoLoopback,
+        }
+    }
+    ProbeResult::NoLoopback
 }
 
 //

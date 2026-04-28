@@ -32,9 +32,14 @@ A single `cargo run` binds three UDP listeners simultaneously and routes whichev
 | Other Codemasters EGO titles ¹ | 20777 | manual | Same listener handles all |
 | BeamNG.drive | 4444 | ✓ auto | LFS-OutGauge format |
 | Live For Speed (and other OutGauge clients) | 4444 | manual | Same listener |
+| Automobilista 2 / Project CARS 2 | 5606 | manual ² | Requires Linux loopback fix ²ʹ |
 | Wreckfest 1, DIRT 5 | — | flagged | No native UDP — would need [SpaceMonkey](https://github.com/PHARTGAMES/SpaceMonkey) under Wine |
 
 ¹ DiRT 2 / 3, F1 2010-2017, GRID / GRID 2 / GRID Autosport, DiRT Rally 1.0 all share the same UDP format on port 20777 and should work, but haven't been individually verified.
+
+² AMS2 stores its UI settings in encrypted `.sav` files that we can't safely edit, so configure-time setup is in-game only.
+
+²ʹ See the **AMS2 / PC2** subsection below for the iptables one-liner needed on Linux.
 
 ## Setup details
 
@@ -53,6 +58,20 @@ Edit `Documents/My Games/<game>/hardwaresettings/hardware_settings_config.xml`. 
 In game: `Options → Other → Protocols → OutGauge`: tick the checkbox, set IP `127.0.0.1`, port `4444`. (Or use `configure`, which edits the underlying `BeamNG.drive/current/settings/cloud/settings.json` directly.)
 
 Caveat: OutGauge doesn't transmit a redline RPM. moza-rev adaptively tracks the highest RPM observed per session and uses that as an effective redline (initial assumption: 7000 RPM, idle: 800 RPM). The bar self-tunes after a few revs.
+
+### Automobilista 2 / Project CARS 2
+
+In game: `Options → System` — set **UDP Protocol Version: Project CARS 2**, **UDP Frequency: 1+** (lower = higher rate; 5 ≈ 120 Hz is plenty). Restart the game so the setting actually applies. Default port `5606`. Shared Memory mode (a separate setting in the same panel) doesn't need to match — UDP works regardless of what it's set to.
+
+**Linux gotcha — broadcast loopback.** AMS2 sends to the limited-broadcast address `255.255.255.255:5606`. Linux emits this packet out the routing-default interface (e.g. `enp0s…`) but does **not** loop it back to local sockets, so `cargo run --example ams2_log` sees nothing despite `tcpdump -i any` clearly showing traffic on the `Out` direction. Workaround — redirect the broadcast back to localhost:
+
+```sh
+sudo iptables -t nat -I OUTPUT -p udp -d 255.255.255.255 --dport 5606 -j DNAT --to-destination 127.0.0.1:5606
+```
+
+This is reversible (`-D` instead of `-I` to remove). Side effect: packets stop going out on the LAN — fine for same-machine telemetry, breaks dual-machine setups.
+
+The same workaround applies to any other Madness-engine title (PC2, PC3) and likely Assetto Corsa / ACC if you ever wire those up — UDP-broadcast-on-Linux behaves the same way regardless of the game.
 
 ## Prerequisites
 
