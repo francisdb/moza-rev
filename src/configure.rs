@@ -5,6 +5,7 @@
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, Write};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -13,11 +14,12 @@ use serde_json::Value;
 /// Steam app ids for games we know how to handle (or recognize).
 const WF2_APP_ID: &str = "1203190";
 const DR2_APP_ID: &str = "690790";
-const DIRT_SHOWDOWN_APP_ID: &str = "65750";
+const DIRT_SHOWDOWN_APP_ID: &str = "201700";
+const BEAMNG_APP_ID: &str = "284160";
 
 /// Detect-only — these run on EGO/proprietary engines without native UDP
 /// telemetry; the only path is memory injection (SpaceMonkey on Windows).
-const NO_TELEMETRY_GAMES: &[(&str, &str)] = &[("228380", "Wreckfest"), ("1097130", "DIRT 5")];
+const NO_TELEMETRY_GAMES: &[(&str, &str)] = &[("228380", "Wreckfest"), ("1038250", "DIRT 5")];
 
 /// Steam library paths to search for installed games.
 fn steam_library_roots() -> Vec<PathBuf> {
@@ -49,13 +51,15 @@ fn proton_documents(app_id: &str) -> Option<PathBuf> {
     None
 }
 
-/// Check whether the game's directory exists under any Steam library's
-/// `steamapps/common`. The directory name is the case-sensitive label
-/// Steam uses (e.g. "Wreckfest 2", "DiRT Rally 2.0").
-fn game_installed(common_dir_name: &str) -> bool {
-    steam_library_roots()
-        .into_iter()
-        .any(|root| root.join("steamapps/common").join(common_dir_name).exists())
+/// Check whether a Steam app is installed by looking for its manifest file.
+/// `steamapps/appmanifest_<id>.acf` is the authoritative source — directory
+/// scans under `steamapps/common` get tripped up by case-sensitive names.
+fn game_installed(app_id: &str) -> bool {
+    steam_library_roots().into_iter().any(|root| {
+        root.join("steamapps")
+            .join(format!("appmanifest_{app_id}.acf"))
+            .exists()
+    })
 }
 
 pub fn run() -> ExitCode {
@@ -63,32 +67,32 @@ pub fn run() -> ExitCode {
 
     let mut any_handled = false;
 
-    if game_installed("Wreckfest 2") {
+    if game_installed(WF2_APP_ID) {
         any_handled = true;
         if let Err(e) = handle_wf2() {
             eprintln!("Wreckfest 2: error: {e}\n");
         }
     }
-    if game_installed("DiRT Rally 2.0") {
+    if game_installed(DR2_APP_ID) {
         any_handled = true;
         if let Err(e) = handle_dr2_style("DiRT Rally 2.0", DR2_APP_ID, "DiRT Rally 2.0") {
             eprintln!("DiRT Rally 2.0: error: {e}\n");
         }
     }
-    if game_installed("DiRT Showdown") {
+    if game_installed(DIRT_SHOWDOWN_APP_ID) {
         any_handled = true;
         if let Err(e) = handle_dr2_style("DiRT Showdown", DIRT_SHOWDOWN_APP_ID, "DiRT Showdown") {
             eprintln!("DiRT Showdown: error: {e}\n");
         }
     }
-    if game_installed("BeamNG.drive") {
+    if game_installed(BEAMNG_APP_ID) {
         any_handled = true;
         if let Err(e) = handle_beamng() {
             eprintln!("BeamNG.drive: error: {e}\n");
         }
     }
     for (app_id, name) in NO_TELEMETRY_GAMES {
-        if game_installed(name) || proton_documents(app_id).is_some() {
+        if game_installed(app_id) {
             any_handled = true;
             println!("{name}");
             println!("  Detected, but the game has no native UDP telemetry.");
@@ -225,31 +229,47 @@ fn handle_dr2_style(name: &str, app_id: &str, my_games_subdir: &str) -> io::Resu
     }
 
     let raw = fs::read_to_string(&config_path)?;
-    let Some(udp_line_range) = find_udp_element_range(&raw) else {
-        println!("  No <udp .../> element found inside <motion_platform>. Leaving alone.\n");
+    let Some(element_range) = find_motion_or_udp_element(&raw) else {
+        println!("  No <udp .../> or <motion .../> element found in the config. Leaving alone.\n");
         return Ok(());
     };
-    let current_line = &raw[udp_line_range.clone()];
+    let current_line = &raw[element_range.clone()];
     let current_enabled = parse_xml_attr(current_line, "enabled");
     let current_extradata = parse_xml_attr(current_line, "extradata");
+    let current_ip = parse_xml_attr(current_line, "ip");
     let current_port = parse_xml_attr(current_line, "port");
 
     println!("  config: {}", config_path.display());
     println!(
-        "  current: enabled={}, extradata={}, port={}",
+        "  current: enabled={}, extradata={}, ip={}, port={}",
         current_enabled.as_deref().unwrap_or("?"),
         current_extradata.as_deref().unwrap_or("?"),
+        current_ip.as_deref().unwrap_or("?"),
         current_port.as_deref().unwrap_or("?"),
     );
 
-    let needs_change =
-        current_enabled.as_deref() != Some("true") || current_extradata.as_deref() != Some("3");
-    if !needs_change {
+    let mut updates: Vec<(&str, &str)> = Vec::new();
+    if current_enabled.as_deref() != Some("true") {
+        updates.push(("enabled", "true"));
+    }
+    if current_extradata.as_deref() != Some("3") {
+        updates.push(("extradata", "3"));
+    }
+    // If `ip` is set to a hardware-platform name (e.g. "dbox") rather than a
+    // real IP, the game won't actually emit UDP. Fix it to localhost.
+    let ip_is_real = current_ip
+        .as_deref()
+        .is_some_and(|ip| ip.parse::<IpAddr>().is_ok());
+    if !ip_is_real {
+        updates.push(("ip", "127.0.0.1"));
+    }
+
+    if updates.is_empty() {
         println!("  ✓ telemetry already enabled with extradata=3 — no changes needed.\n");
         return Ok(());
     }
 
-    let new_line = rewrite_udp_attrs(current_line, &[("enabled", "true"), ("extradata", "3")]);
+    let new_line = rewrite_xml_attrs(current_line, &updates);
     println!("  proposed:\n    -{current_line}\n    +{new_line}");
     if !confirm("  Apply?")? {
         println!("  skipped.\n");
@@ -257,19 +277,27 @@ fn handle_dr2_style(name: &str, app_id: &str, my_games_subdir: &str) -> io::Resu
     }
 
     let mut new_raw = String::with_capacity(raw.len());
-    new_raw.push_str(&raw[..udp_line_range.start]);
+    new_raw.push_str(&raw[..element_range.start]);
     new_raw.push_str(&new_line);
-    new_raw.push_str(&raw[udp_line_range.end..]);
+    new_raw.push_str(&raw[element_range.end..]);
     write_with_backup(&config_path, &new_raw)?;
     println!("  ✓ written.\n");
     Ok(())
 }
 
-/// Locate `<udp ... />` (anywhere in the XML — game has only one).
-fn find_udp_element_range(xml: &str) -> Option<std::ops::Range<usize>> {
-    let start = xml.find("<udp ")?;
-    let rel_end = xml[start..].find("/>")?;
-    Some(start..start + rel_end + 2)
+/// Locate the UDP/motion element in a Codemasters EGO-engine config.
+/// Newer games (DR1, DR2) wrap it as `<motion_platform><udp ... /></...>`;
+/// older ones (DiRT Showdown, DiRT 2/3, F1 2010-2012) use `<motion ... />`
+/// directly. Both have the same attribute set.
+fn find_motion_or_udp_element(xml: &str) -> Option<std::ops::Range<usize>> {
+    for needle in ["<udp ", "<motion "] {
+        if let Some(start) = xml.find(needle)
+            && let Some(rel_end) = xml[start..].find("/>")
+        {
+            return Some(start..start + rel_end + 2);
+        }
+    }
+    None
 }
 
 /// Pull a single attribute out of a self-closing XML tag — naive but the
@@ -283,7 +311,7 @@ fn parse_xml_attr(element: &str, attr: &str) -> Option<String> {
 }
 
 /// Replace specific attributes in an XML element, preserving the rest.
-fn rewrite_udp_attrs(element: &str, updates: &[(&str, &str)]) -> String {
+fn rewrite_xml_attrs(element: &str, updates: &[(&str, &str)]) -> String {
     let mut out = element.to_owned();
     for (key, value) in updates {
         let needle = format!("{key}=\"");
@@ -418,7 +446,7 @@ mod tests {
     fn rewrites_only_listed_attributes() {
         let original =
             r#"<udp enabled="false" extradata="0" ip="127.0.0.1" port="20777" delay="1" />"#;
-        let updated = rewrite_udp_attrs(original, &[("enabled", "true"), ("extradata", "3")]);
+        let updated = rewrite_xml_attrs(original, &[("enabled", "true"), ("extradata", "3")]);
         assert!(updated.contains(r#"enabled="true""#));
         assert!(updated.contains(r#"extradata="3""#));
         // Untouched attrs preserved.
@@ -429,11 +457,33 @@ mod tests {
 
     #[test]
     fn finds_udp_element_inside_motion_platform() {
+        // Newer DR2-style XML.
         let xml = "<motion_platform>\n\t<dbox enabled=\"true\" />\n\t<udp enabled=\"false\" port=\"20777\" />\n</motion_platform>";
-        let range = find_udp_element_range(xml).unwrap();
+        let range = find_motion_or_udp_element(xml).unwrap();
         assert_eq!(
             &xml[range.clone()],
             "<udp enabled=\"false\" port=\"20777\" />"
         );
+    }
+
+    #[test]
+    fn finds_motion_element_in_older_games() {
+        // DiRT Showdown and other pre-DR1 Codemasters games.
+        let xml = r#"<hardware_settings_config>
+	<motion enabled="true" ip="dbox" port="20777" delay="1" extradata="0" />
+</hardware_settings_config>"#;
+        let range = find_motion_or_udp_element(xml).unwrap();
+        assert_eq!(
+            &xml[range.clone()],
+            r#"<motion enabled="true" ip="dbox" port="20777" delay="1" extradata="0" />"#
+        );
+    }
+
+    #[test]
+    fn prefers_udp_over_motion_when_both_present() {
+        // Defensive: if a future game has both elements, take <udp>.
+        let xml = r#"<x><motion enabled="false" /><udp enabled="true" /></x>"#;
+        let range = find_motion_or_udp_element(xml).unwrap();
+        assert!(xml[range].starts_with("<udp "));
     }
 }
