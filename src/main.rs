@@ -1,27 +1,34 @@
 use std::env;
-use std::io;
 use std::io::Write;
 use std::net::UdpSocket;
 use std::process::ExitCode;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use log::{debug, error, info, warn};
 
+use moza_rev::codemasters_legacy::{self, Telemetry};
 use moza_rev::moza::{self, BaseTemps, Moza, Protocol};
 use moza_rev::wreckfest::{self, EngineState};
 
-const DEFAULT_PORT: u16 = 23123;
+const DEFAULT_WF2_PORT: u16 = 23123;
+const DEFAULT_DR2_PORT: u16 = codemasters_legacy::DEFAULT_PORT; // 20777
 const DEFAULT_LED_COUNT: usize = 10;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
 const STATUS_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Time without a packet from the active game before we revert to "no game"
+/// and clear the LED bar.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How often to read the wheelbase temperature sensors.
 const TEMP_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// Per-sensor read timeout. Each `read_base_temps` call does three sequential
 /// reads, so worst-case wall time is 3x this if all sensors fail to respond.
 const TEMP_READ_DEADLINE: Duration = Duration::from_millis(300);
-/// `recv` timeout so the loop wakes up periodically to do thermal polling
-/// even when no UDP packets are arriving (e.g. game paused, in menu).
+/// `recv_timeout` window so the loop wakes regularly to do thermal polling
+/// and idle-detection even when no telemetry is arriving.
 const RECV_TIMEOUT: Duration = Duration::from_millis(250);
 
 // Approximate "elevated" thresholds. Moza firmware auto-protects somewhere
@@ -29,6 +36,28 @@ const RECV_TIMEOUT: Duration = Duration::from_millis(250);
 const MCU_TEMP_WARN_C: f32 = 75.0;
 const MOSFET_TEMP_WARN_C: f32 = 70.0;
 const MOTOR_TEMP_WARN_C: f32 = 95.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GameId {
+    Wreckfest2,
+    /// Any Codemasters EGO-engine title using the "extradata" UDP format
+    /// (DiRT 2/3/Showdown, F1 2010-2017, GRID series, DiRT Rally, DR2).
+    CodemastersLegacy,
+}
+
+impl GameId {
+    fn label(self) -> &'static str {
+        match self {
+            GameId::Wreckfest2 => "WF2",
+            GameId::CodemastersLegacy => "DR2",
+        }
+    }
+}
+
+struct Update {
+    game: GameId,
+    engine: EngineState,
+}
 
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -41,16 +70,6 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-
-    let bind_addr = format!("0.0.0.0:{}", args.port);
-    let socket = match UdpSocket::bind(&bind_addr) {
-        Ok(s) => s,
-        Err(e) => {
-            error!("bind {bind_addr}: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    info!("listening for Wreckfest 2 telemetry on udp://{bind_addr}");
 
     let serial_path = match args.serial_path.or_else(moza::find_wheelbase) {
         Some(p) => p,
@@ -74,16 +93,20 @@ fn main() -> ExitCode {
         }
     };
 
-    if let Err(e) = socket.set_read_timeout(Some(RECV_TIMEOUT)) {
-        error!("set socket read timeout: {e}");
+    let (tx, rx) = mpsc::channel::<Update>();
+    if !spawn_listener(args.wf2_port, GameId::Wreckfest2, tx.clone()) {
+        return ExitCode::FAILURE;
+    }
+    if !spawn_listener(args.dr2_port, GameId::CodemastersLegacy, tx) {
         return ExitCode::FAILURE;
     }
 
-    let mut buf = vec![0u8; 2048];
     let mut last_bitmask: Option<u32> = None;
     let mut last_send = Instant::now();
     let mut last_status = Instant::now();
     let mut last_temp_poll = Instant::now() - TEMP_POLL_INTERVAL; // poll once on startup
+    let mut active_game: Option<GameId> = None;
+    let mut last_packet_at: Option<Instant> = None;
     let mut packets_since_status: u32 = 0;
 
     loop {
@@ -92,25 +115,35 @@ fn main() -> ExitCode {
             last_temp_poll = Instant::now();
         }
 
-        let n = match socket.recv(&mut buf) {
-            Ok(n) => n,
-            Err(e)
-                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
-            {
-                continue;
-            }
-            Err(e) => {
-                error!("recv: {e}");
-                continue;
+        // Idle timeout: if the active game stops sending, clear the bar so
+        // the wheel returns to its breathing pattern.
+        if let Some(t) = last_packet_at
+            && t.elapsed() >= IDLE_TIMEOUT
+            && active_game.is_some()
+        {
+            info!("no telemetry for {:?} — going idle", IDLE_TIMEOUT);
+            active_game = None;
+            last_bitmask = None;
+            let _ = wheel.send_rpm_bitmask(0, args.led_count);
+        }
+
+        let update = match rx.recv_timeout(RECV_TIMEOUT) {
+            Ok(u) => u,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => {
+                error!("all listener threads exited; shutting down");
+                return ExitCode::FAILURE;
             }
         };
-        let Some(engine) = wreckfest::parse_main(&buf[..n]) else {
-            continue;
-        };
+
+        if active_game != Some(update.game) {
+            info!("active game: {}", update.game.label());
+            active_game = Some(update.game);
+        }
+        last_packet_at = Some(Instant::now());
         packets_since_status += 1;
 
-        let bitmask = rpm_to_bitmask(&engine, args.led_count);
-
+        let bitmask = rpm_to_bitmask(&update.engine, args.led_count);
         let changed = Some(bitmask) != last_bitmask;
         let stale = last_send.elapsed() >= HEARTBEAT_INTERVAL;
         if changed || stale {
@@ -123,11 +156,19 @@ fn main() -> ExitCode {
         }
 
         if args.verbose {
-            print_status(&engine, bitmask, args.led_count, packets_since_status, true);
+            print_status(
+                update.game,
+                &update.engine,
+                bitmask,
+                args.led_count,
+                packets_since_status,
+                true,
+            );
             packets_since_status = 0;
         } else if last_status.elapsed() >= STATUS_INTERVAL {
             print_status(
-                &engine,
+                update.game,
+                &update.engine,
                 bitmask,
                 args.led_count,
                 packets_since_status,
@@ -135,6 +176,67 @@ fn main() -> ExitCode {
             );
             last_status = Instant::now();
             packets_since_status = 0;
+        }
+    }
+}
+
+/// Spawn a UDP listener thread for `game` on `port`. Returns true on
+/// successful bind, false if the port couldn't be claimed (caller should
+/// fail-fast in that case).
+fn spawn_listener(port: u16, game: GameId, tx: mpsc::Sender<Update>) -> bool {
+    let bind_addr = format!("0.0.0.0:{port}");
+    let socket = match UdpSocket::bind(&bind_addr) {
+        Ok(s) => s,
+        Err(e) => {
+            error!("bind {} {bind_addr}: {e}", game.label());
+            return false;
+        }
+    };
+    info!(
+        "listening for {} telemetry on udp://{bind_addr}",
+        game.label()
+    );
+    thread::Builder::new()
+        .name(format!("listener-{}", game.label()))
+        .spawn(move || listener_loop(socket, game, tx))
+        .expect("failed to spawn listener thread");
+    true
+}
+
+fn listener_loop(socket: UdpSocket, game: GameId, tx: mpsc::Sender<Update>) {
+    let mut buf = vec![0u8; 2048];
+    loop {
+        let n = match socket.recv(&mut buf) {
+            Ok(n) => n,
+            Err(e) => {
+                error!("{} recv: {e}", game.label());
+                continue;
+            }
+        };
+        let Some(engine) = parse(game, &buf[..n]) else {
+            continue;
+        };
+        if tx.send(Update { game, engine }).is_err() {
+            // Receiver dropped → main has exited.
+            return;
+        }
+    }
+}
+
+fn parse(game: GameId, buf: &[u8]) -> Option<EngineState> {
+    match game {
+        GameId::Wreckfest2 => wreckfest::parse_main(buf),
+        GameId::CodemastersLegacy => {
+            let t = Telemetry::from_bytes(buf)?;
+            // Skip frames before the engine is "real" (in menus, redline=0).
+            if t.redline_rpm() <= t.idle_rpm() {
+                return None;
+            }
+            Some(EngineState {
+                rpm: t.rpm(),
+                rpm_redline: t.redline_rpm(),
+                rpm_idle: t.idle_rpm(),
+            })
         }
     }
 }
@@ -174,11 +276,23 @@ fn fmt_temp(t: Option<f32>) -> String {
     t.map_or_else(|| "?".to_string(), |c| format!("{c:.1}°C"))
 }
 
-fn print_status(engine: &EngineState, bitmask: u32, led_count: usize, packets: u32, verbose: bool) {
+fn print_status(
+    game: GameId,
+    engine: &EngineState,
+    bitmask: u32,
+    led_count: usize,
+    packets: u32,
+    verbose: bool,
+) {
     let bar = led_bar(bitmask, led_count);
     let line = format!(
-        "rpm {:>5} / {:>5}  idle {:>4}  [{}]  {} pkt",
-        engine.rpm, engine.rpm_redline, engine.rpm_idle, bar, packets
+        "[{}] rpm {:>5} / {:>5}  idle {:>4}  [{}]  {} pkt",
+        game.label(),
+        engine.rpm,
+        engine.rpm_redline,
+        engine.rpm_idle,
+        bar,
+        packets
     );
     if verbose {
         println!("{line}");
@@ -220,7 +334,8 @@ fn rpm_to_bitmask(engine: &EngineState, led_count: usize) -> u32 {
 }
 
 struct Args {
-    port: u16,
+    wf2_port: u16,
+    dr2_port: u16,
     serial_path: Option<String>,
     led_count: usize,
     protocol: Option<Protocol>,
@@ -229,7 +344,8 @@ struct Args {
 
 impl Args {
     fn from_env() -> Result<Self, String> {
-        let mut port = DEFAULT_PORT;
+        let mut wf2_port = DEFAULT_WF2_PORT;
+        let mut dr2_port = DEFAULT_DR2_PORT;
         let mut serial_path = None;
         let mut led_count = DEFAULT_LED_COUNT;
         let mut protocol = None;
@@ -238,9 +354,13 @@ impl Args {
         let mut it = env::args().skip(1);
         while let Some(arg) = it.next() {
             match arg.as_str() {
-                "--port" | "-p" => {
-                    let v = it.next().ok_or("--port needs a value")?;
-                    port = v.parse().map_err(|_| format!("invalid port: {v}"))?;
+                "--wf2-port" => {
+                    let v = it.next().ok_or("--wf2-port needs a value")?;
+                    wf2_port = v.parse().map_err(|_| format!("invalid port: {v}"))?;
+                }
+                "--dr2-port" => {
+                    let v = it.next().ok_or("--dr2-port needs a value")?;
+                    dr2_port = v.parse().map_err(|_| format!("invalid port: {v}"))?;
                 }
                 "--serial" | "-s" => {
                     serial_path = Some(it.next().ok_or("--serial needs a path")?);
@@ -272,7 +392,8 @@ impl Args {
             }
         }
         Ok(Self {
-            port,
+            wf2_port,
+            dr2_port,
             serial_path,
             led_count,
             protocol,
@@ -283,17 +404,26 @@ impl Args {
 
 fn print_usage() {
     eprintln!(
-        "moza-rev — drive the Moza wheel's RPM LED bar from Wreckfest 2 telemetry\n\
+        "moza-rev — drive the Moza wheel's RPM LED bar from game telemetry\n\
          \n\
-         usage: moza-rev [--port PORT] [--serial /dev/ttyACMx] [--leds N] [--protocol modern|legacy] [-v]\n\
+         usage: moza-rev [--wf2-port PORT] [--dr2-port PORT] [--serial /dev/ttyACMx]\n\
+                          [--leds N] [--protocol modern|legacy] [-v]\n\
          \n\
-         defaults: --port {DEFAULT_PORT}, --leds {DEFAULT_LED_COUNT}, serial+protocol autodetected.\n\
-         R3 / R5 bases default to legacy; everything else to modern.\n\
+         defaults: --wf2-port {DEFAULT_WF2_PORT} (Wreckfest 2 \"Pino\")\n\
+                   --dr2-port {DEFAULT_DR2_PORT} (Codemasters legacy: DR2, DR1, F1 2010-2017,\n\
+                                                  Dirt 2/3/Showdown, GRID series)\n\
+                   --leds {DEFAULT_LED_COUNT}, serial+protocol autodetected.\n\
          \n\
-         Wreckfest 2 telemetry must be enabled first. Set \"enabled\": 1 in:\n\
+         Both listeners run simultaneously. The active game is whichever\n\
+         was last to send a packet; the wheel goes idle after 2s of silence.\n\
+         \n\
+         Wreckfest 2: enable telemetry by setting \"enabled\": 1 in:\n\
            ~/.var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/\n\
              compatdata/1203190/pfx/drive_c/users/steamuser/Documents/My Games/\n\
-             Wreckfest 2/<userid>/savegame/telemetry/config.json"
+             Wreckfest 2/<userid>/savegame/telemetry/config.json\n\
+         \n\
+         DiRT Rally 2.0: edit hardware_settings_config.xml, set the <udp> child\n\
+           of <motion_platform> to enabled=\"true\" extradata=\"3\"."
     );
 }
 

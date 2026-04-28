@@ -17,7 +17,7 @@ cargo build --release
 
 ### Run
 
-Default: listen for Wreckfest 2 telemetry on UDP `:23123`, autodetect the Moza wheelbase, drive the LEDs.
+Default: listen for Wreckfest 2 (UDP `:23123`) **and** DiRT Rally 2.0 / other Codemasters EGO-engine titles (UDP `:20777`) simultaneously, autodetect the Moza wheelbase, drive the LEDs from whichever game is currently sending packets. The active game is shown in the status line; the wheel falls back to its idle breathing pattern after 2 seconds without any telemetry.
 
 ```sh
 cargo run --release
@@ -26,7 +26,8 @@ cargo run --release
 Useful flags:
 
 ```sh
-cargo run --release -- --port 23123          # change UDP port
+cargo run --release -- --wf2-port 23123      # change Wreckfest 2 UDP port
+cargo run --release -- --dr2-port 20777      # change Codemasters legacy UDP port
 cargo run --release -- --serial /dev/ttyACM0 # override the autodetected serial path
 cargo run --release -- --leds 10             # number of LEDs on the wheel (default 10)
 cargo run --release -- --protocol legacy     # force legacy (R3/R5/ES); modern is default for everything else
@@ -62,7 +63,7 @@ Telemetry is off by default. Edit the game's `config.json` and set `"enabled": 1
 
 For native Steam installs the prefix replaces `~/.var/app/com.valvesoftware.Steam/.local/share/Steam` with `~/.steam/steam`.
 
-Default UDP port is `23123` — matches `moza-rev`'s default. Override with `--port` on either side if needed.
+Default UDP port is `23123` — matches `moza-rev`'s default. Override with `--wf2-port` if needed.
 
 ### DiRT Rally 2.0
 
@@ -80,9 +81,9 @@ Find the `<motion_platform>` block and set:
 <udp enabled="true" extradata="3" ip="127.0.0.1" port="20777" delay="1" />
 ```
 
-`extradata=3` is what gives you the full 264-byte packet with RPM, redline, and idle RPM. Lower values send a shorter packet and `dr2_log` will warn that fields are missing. Default UDP port is `20777` — Codemasters' standard.
+`extradata=3` is what gives you the full 264-byte packet with RPM, redline, and idle RPM. Lower values send a shorter packet and `dr2_log` will warn that fields are missing. Default UDP port is `20777` — Codemasters' standard. Override with `--dr2-port` if needed.
 
-Note: only `moza-rev`'s `dr2_log` example currently consumes this. Wiring DR2 telemetry into the main LED-driver binary requires a separate parser module — not done yet.
+The same parser handles **any Codemasters EGO-engine title using the legacy "extradata" UDP format**: DiRT 2 / 3 / Showdown, F1 2010-2017, GRID / GRID 2 / GRID Autosport, DiRT Rally, DiRT Rally 2.0. Just point the game at port 20777 and it will be picked up automatically.
 
 ## Logging
 
