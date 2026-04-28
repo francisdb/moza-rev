@@ -83,7 +83,9 @@ pub fn run() -> ExitCode {
     }
     if game_installed("BeamNG.drive") {
         any_handled = true;
-        handle_beamng();
+        if let Err(e) = handle_beamng() {
+            eprintln!("BeamNG.drive: error: {e}\n");
+        }
     }
     for (app_id, name) in NO_TELEMETRY_GAMES {
         if game_installed(name) || proton_documents(app_id).is_some() {
@@ -297,16 +299,79 @@ fn rewrite_udp_attrs(element: &str, updates: &[(&str, &str)]) -> String {
 }
 
 //
-// BeamNG.drive
+// BeamNG.drive — JSON config under XDG data, not Steam compatdata
 //
 
-fn handle_beamng() {
+const BEAMNG_DEFAULT_PORT: i64 = 4444;
+const BEAMNG_DEFAULT_ADDRESS: &str = "127.0.0.1";
+
+/// BeamNG.drive writes its settings outside the Steam Wine prefix, into the
+/// host's XDG data dir (so they survive Proton prefix wipes). Look in both
+/// the Flatpak Steam and the native paths.
+fn beamng_cloud_settings() -> Option<PathBuf> {
+    let home = env::var_os("HOME").map(PathBuf::from)?;
+    let candidates = [
+        home.join(".var/app/com.valvesoftware.Steam/.local/share/BeamNG/BeamNG.drive/current/settings/cloud/settings.json"),
+        home.join(".local/share/BeamNG/BeamNG.drive/current/settings/cloud/settings.json"),
+    ];
+    candidates.into_iter().find(|p| p.exists())
+}
+
+fn handle_beamng() -> io::Result<()> {
     println!("BeamNG.drive");
-    println!("  OutGauge config lives in BeamNG's user data directory and isn't");
-    println!("  a single attribute we can confidently flip from outside the game.");
-    println!("  Enable it manually:");
-    println!("    Options → Other → Protocols → OutGauge: ip 127.0.0.1, port 4444, enable");
+    let Some(settings_path) = beamng_cloud_settings() else {
+        println!(
+            "  Installed but no settings/cloud/settings.json yet — start the game once, then re-run.\n"
+        );
+        return Ok(());
+    };
+
+    let raw = fs::read_to_string(&settings_path)?;
+    let mut doc: Value = serde_json::from_str(&raw)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+
+    // Keys absent → defaults from BeamNG/settings/defaults.json.
+    let current_enabled = doc
+        .get("protocols_outgauge_enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let current_address = doc
+        .get("protocols_outgauge_address")
+        .and_then(Value::as_str)
+        .unwrap_or(BEAMNG_DEFAULT_ADDRESS)
+        .to_owned();
+    let current_port = doc
+        .get("protocols_outgauge_port")
+        .and_then(Value::as_i64)
+        .unwrap_or(BEAMNG_DEFAULT_PORT);
+
+    println!("  config: {}", settings_path.display());
+    println!(
+        "  current: OutGauge enabled={current_enabled}, address={current_address}, port={current_port}"
+    );
+
+    if current_enabled {
+        println!("  ✓ OutGauge already enabled — no changes needed.");
+        println!("  Note: moza-rev's main listener doesn't yet consume OutGauge frames.\n");
+        return Ok(());
+    }
+
+    println!(
+        "  proposed: protocols_outgauge_enabled = true (address/port unchanged: {current_address}:{current_port})"
+    );
+    println!("  ⚠ close BeamNG before applying — a running game may overwrite the change.");
+    if !confirm("  Apply?")? {
+        println!("  skipped.\n");
+        return Ok(());
+    }
+
+    doc["protocols_outgauge_enabled"] = Value::from(true);
+    let new_raw = serde_json::to_string_pretty(&doc)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    write_with_backup(&settings_path, &new_raw)?;
+    println!("  ✓ written.");
     println!("  Note: moza-rev's main listener doesn't yet consume OutGauge frames.\n");
+    Ok(())
 }
 
 //
