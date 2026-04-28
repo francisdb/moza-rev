@@ -9,8 +9,8 @@
 //   <udp enabled="true" extradata="3" ip="127.0.0.1" port="20777" delay="1" />
 //
 // Run:
-//   cargo run --example dr2_log
-//   cargo run --example dr2_log -- --port 20777
+//   cargo run --example dirt_rally_2_log
+//   cargo run --example dirt_rally_2_log -- --port 20777
 
 use std::env;
 use std::net::UdpSocket;
@@ -38,7 +38,7 @@ fn main() -> ExitCode {
                 };
             }
             "--help" | "-h" => {
-                eprintln!("usage: dr2_log [--port PORT]");
+                eprintln!("usage: dirt_rally_2_log [--port PORT]");
                 return ExitCode::SUCCESS;
             }
             other => {

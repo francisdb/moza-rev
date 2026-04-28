@@ -15,8 +15,8 @@
 //     -j DNAT --to-destination 127.0.0.1:5606
 //
 // Run:
-//   cargo run --example ams2_log
-//   cargo run --example ams2_log -- --port 5606
+//   cargo run --example automobilista_2_log
+//   cargo run --example automobilista_2_log -- --port 5606
 
 use std::env;
 use std::net::UdpSocket;
@@ -49,7 +49,7 @@ fn main() -> ExitCode {
                 };
             }
             "--help" | "-h" => {
-                eprintln!("usage: ams2_log [--port PORT]");
+                eprintln!("usage: automobilista_2_log [--port PORT]");
                 return ExitCode::SUCCESS;
             }
             other => {

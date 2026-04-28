@@ -3,8 +3,8 @@
 // packet types arrive at what rate.
 //
 // Run:
-//   cargo run --example wf2_log
-//   cargo run --example wf2_log -- --port 23123
+//   cargo run --example wreckfest_2_log
+//   cargo run --example wreckfest_2_log -- --port 23123
 
 use std::env;
 use std::net::UdpSocket;
@@ -34,7 +34,7 @@ fn main() -> ExitCode {
                 };
             }
             "--help" | "-h" => {
-                eprintln!("usage: wf2_log [--port PORT]");
+                eprintln!("usage: wreckfest_2_log [--port PORT]");
                 return ExitCode::SUCCESS;
             }
             other => {

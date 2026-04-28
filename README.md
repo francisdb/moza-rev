@@ -63,7 +63,7 @@ Caveat: OutGauge doesn't transmit a redline RPM. moza-rev adaptively tracks the 
 
 In game: `Options → System` — set **UDP Protocol Version: Project CARS 2**, **UDP Frequency: 1+** (lower = higher rate; 5 ≈ 120 Hz is plenty). Restart the game so the setting actually applies. Default port `5606`. Shared Memory mode (a separate setting in the same panel) doesn't need to match — UDP works regardless of what it's set to.
 
-**Linux gotcha — broadcast loopback.** AMS2 sends to the limited-broadcast address `255.255.255.255:5606`. Linux emits this packet out the routing-default interface (e.g. `enp0s…`) but does **not** loop it back to local sockets, so `cargo run --example ams2_log` sees nothing despite `tcpdump -i any` clearly showing traffic on the `Out` direction. Workaround — redirect the broadcast back to localhost:
+**Linux gotcha — broadcast loopback.** AMS2 sends to the limited-broadcast address `255.255.255.255:5606`. Linux emits this packet out the routing-default interface (e.g. `enp0s…`) but does **not** loop it back to local sockets, so `cargo run --example automobilista_2_log` sees nothing despite `tcpdump -i any` clearly showing traffic on the `Out` direction. Workaround — redirect the broadcast back to localhost:
 
 ```sh
 sudo iptables -t nat -I OUTPUT -p udp -d 255.255.255.255 --dport 5606 -j DNAT --to-destination 127.0.0.1:5606
@@ -104,10 +104,10 @@ cargo run --example led_chase    # visual chase pattern; confirms LED writes wor
 cargo run --example blast 1023   # full bar at sustained rate; sanity-check the wire
 cargo run --example logcat       # dump every Moza protocol frame on the bus
 cargo run --example diagnose     # probe wheel settings (RPM mode, indicator mode, etc.)
-cargo run --example wf2_log      # one-line summary per Wreckfest 2 telemetry packet
-cargo run --example dr2_log      # one-line summary per Codemasters EGO packet
-cargo run --example beamng_log   # one-line summary per OutGauge packet
-cargo run --example ams2_log     # one-line summary per AMS2 / PC2 telemetry packet
+cargo run --example wreckfest_2_log      # one-line summary per Wreckfest 2 telemetry packet
+cargo run --example dirt_rally_2_log     # one-line summary per Codemasters EGO packet
+cargo run --example beamng_log           # one-line summary per OutGauge packet
+cargo run --example automobilista_2_log  # one-line summary per AMS2 / PC2 telemetry packet
 ```
 
 ## Logging
