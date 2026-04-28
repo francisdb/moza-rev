@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use log::{debug, error, info, warn};
 
 use moza_rev::codemasters_legacy::{self, Telemetry};
+use moza_rev::configure;
 use moza_rev::moza::{self, BaseTemps, Moza, Protocol};
 use moza_rev::wreckfest::{self, EngineState};
 
@@ -61,6 +62,12 @@ struct Update {
 
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    // Subcommands. Anything else (including no args) drops into the
+    // listener flow with the existing flag parser.
+    if env::args().nth(1).as_deref() == Some("configure") {
+        return configure::run();
+    }
 
     let args = match Args::from_env() {
         Ok(a) => a,
@@ -408,6 +415,7 @@ fn print_usage() {
          \n\
          usage: moza-rev [--wf2-port PORT] [--dr2-port PORT] [--serial /dev/ttyACMx]\n\
                           [--leds N] [--protocol modern|legacy] [-v]\n\
+                moza-rev configure   # detect installed games and offer to enable telemetry\n\
          \n\
          defaults: --wf2-port {DEFAULT_WF2_PORT} (Wreckfest 2 \"Pino\")\n\
                    --dr2-port {DEFAULT_DR2_PORT} (Codemasters legacy: DR2, DR1, F1 2010-2017,\n\

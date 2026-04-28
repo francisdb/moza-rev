@@ -15,6 +15,16 @@ Control the moza race wheel rev meter with game telemetry
 cargo build --release
 ```
 
+### Configure
+
+Scan for installed Steam games and offer to enable their telemetry config (read-only by default — every change requires `y/N` confirmation and writes a `.bak` next to the original):
+
+```sh
+cargo run --release -- configure
+```
+
+Currently handles: Wreckfest 2 (JSON), DiRT Rally 2.0 + DiRT Showdown (XML, same format). Detects but doesn't auto-edit: BeamNG.drive (prints OutGauge instructions). Detects but flags as no-telemetry: Wreckfest 1, DIRT 5 (these need memory-injection tools like SpaceMonkey).
+
 ### Run
 
 Default: listen for Wreckfest 2 (UDP `:23123`) **and** DiRT Rally 2.0 / other Codemasters EGO-engine titles (UDP `:20777`) simultaneously, autodetect the Moza wheelbase, drive the LEDs from whichever game is currently sending packets. The active game is shown in the status line; the wheel falls back to its idle breathing pattern after 2 seconds without any telemetry.
