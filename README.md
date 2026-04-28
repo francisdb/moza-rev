@@ -53,6 +53,7 @@ cargo run --example logcat       # dump every protocol frame seen on the bus
 cargo run --example diagnose     # probe wheel settings (RPM mode, indicator mode, etc.)
 cargo run --example wf2_log      # log a one-line summary per Wreckfest 2 telemetry packet
 cargo run --example dr2_log      # log a one-line summary per DiRT Rally 2.0 telemetry packet
+cargo run --example beamng_log   # log a one-line summary per BeamNG OutGauge packet (LFS-compatible)
 ```
 
 ## Tested devices
