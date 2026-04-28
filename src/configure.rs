@@ -21,6 +21,50 @@ const BEAMNG_APP_ID: &str = "284160";
 /// telemetry; the only path is memory injection (SpaceMonkey on Windows).
 const NO_TELEMETRY_GAMES: &[(&str, &str)] = &[("228380", "Wreckfest"), ("1038250", "DIRT 5")];
 
+/// Games that have native UDP telemetry but use protocols moza-rev's
+/// listener doesn't speak yet (Assetto Corsa family, Madness engine).
+/// Detected and reported here so the status report is complete; users
+/// can enable telemetry manually if they want to use other tools.
+struct ManualEntry {
+    app_id: &'static str,
+    name: &'static str,
+    notes: &'static str,
+}
+
+const MANUAL_TELEMETRY_GAMES: &[ManualEntry] = &[
+    ManualEntry {
+        app_id: "244210",
+        name: "Assetto Corsa",
+        notes: "  Has UDP remote telemetry (handshake protocol on ports 9996/9997).\n  \
+                Enable in-game via Apps menu, or edit Documents/Assetto Corsa/cfg/.\n  \
+                moza-rev does not yet have an AC parser.",
+    },
+    ManualEntry {
+        app_id: "805550",
+        name: "Assetto Corsa Competizione",
+        notes: "  Has UDP Broadcasting API (port 9000, password handshake — connection-oriented).\n  \
+                Edit Documents/Assetto Corsa Competizione/Config/broadcasting.json:\n  \
+                  udpListenerPort: 9000, connectionPassword: <set this>.\n  \
+                moza-rev does not yet have an ACC parser.",
+    },
+    ManualEntry {
+        app_id: "3917090",
+        name: "Assetto Corsa Rally",
+        notes: "  Has UDP remote telemetry (same format as base Assetto Corsa).\n  \
+                Some fields are not yet populated in early access.\n  \
+                moza-rev does not yet have an AC-family parser.",
+    },
+    ManualEntry {
+        app_id: "1066890",
+        name: "Automobilista 2",
+        notes: "  Has UDP telemetry on port 5606 using the Project CARS 2 format.\n  \
+                In game: Options → System → UDP Protocol Version: Project CARS 2,\n  \
+                                          Shared Memory: Project CARS 2,\n  \
+                                          UDP Frequency: 1+\n  \
+                moza-rev does not yet have a Madness-engine parser.",
+    },
+];
+
 /// Steam library paths to search for installed games.
 fn steam_library_roots() -> Vec<PathBuf> {
     let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
@@ -89,6 +133,13 @@ pub fn run() -> ExitCode {
         any_handled = true;
         if let Err(e) = handle_beamng() {
             eprintln!("BeamNG.drive: error: {e}\n");
+        }
+    }
+    for entry in MANUAL_TELEMETRY_GAMES {
+        if game_installed(entry.app_id) {
+            any_handled = true;
+            println!("{}", entry.name);
+            println!("{}\n", entry.notes);
         }
     }
     for (app_id, name) in NO_TELEMETRY_GAMES {
@@ -380,7 +431,7 @@ fn handle_beamng() -> io::Result<()> {
 
     if current_enabled {
         println!("  ✓ OutGauge already enabled — no changes needed.");
-        println!("  Note: moza-rev's main listener doesn't yet consume OutGauge frames.\n");
+        println!();
         return Ok(());
     }
 
@@ -398,7 +449,7 @@ fn handle_beamng() -> io::Result<()> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     write_with_backup(&settings_path, &new_raw)?;
     println!("  ✓ written.");
-    println!("  Note: moza-rev's main listener doesn't yet consume OutGauge frames.\n");
+    println!();
     Ok(())
 }
 
