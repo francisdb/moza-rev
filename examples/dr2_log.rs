@@ -1,17 +1,12 @@
 // Listen for DiRT Rally 2.0 telemetry and log a one-line summary per packet.
-//
-// DR2's UDP format is the Codemasters "extradata" protocol: a contiguous
-// little-endian f32 array, no header, no signature. With `extradata=3` the
-// packet is 264 bytes (66 fields). RPM/max-RPM/idle-RPM are encoded as
-// `actual_rpm / 10` per Codemasters convention.
-//
-// Schema cross-referenced from
-// https://github.com/ErlerPhilipp/dr2_logger/blob/master/source/dirt_rally/udp_data.py
+// Uses the shared `codemasters_legacy` parser, so the same example also
+// works for any other Codemasters EGO-engine title (DiRT 2/3/Showdown,
+// F1 2010-2017, GRID series, DiRT Rally) with telemetry enabled.
 //
 // Enable telemetry by editing
 // `Documents/My Games/DiRT Rally 2.0/hardwaresettings/hardware_settings_config.xml`
-// and setting:
-//   <motion enabled="true" ip="127.0.0.1" port="20777" extradata="3" delay="1"/>
+// — find the `<motion_platform>` block and set the `<udp>` child to:
+//   <udp enabled="true" extradata="3" ip="127.0.0.1" port="20777" delay="1" />
 //
 // Run:
 //   cargo run --example dr2_log
@@ -23,26 +18,7 @@ use std::process::ExitCode;
 
 use log::{error, info};
 
-const DEFAULT_PORT: u16 = 20777;
-const MIN_BYTES_FOR_RPM: usize = (FIELD_RPM + 1) * 4;
-
-// Field indices into the f32 array (multiply by 4 for byte offset).
-const FIELD_RUN_TIME: usize = 0;
-const FIELD_LAP_TIME: usize = 1;
-const FIELD_DISTANCE: usize = 2;
-const FIELD_SPEED_MS: usize = 7;
-const FIELD_THROTTLE: usize = 29;
-const FIELD_STEERING: usize = 30;
-const FIELD_BRAKE: usize = 31;
-const FIELD_CLUTCH: usize = 32;
-const FIELD_GEAR: usize = 33;
-const FIELD_CURRENT_LAP: usize = 36;
-const FIELD_RPM: usize = 37; // value × 10 = actual RPM
-const FIELD_CAR_POS: usize = 39;
-const FIELD_LAPS_COMPLETED: usize = 59;
-const FIELD_TOTAL_LAPS: usize = 60;
-const FIELD_MAX_RPM: usize = 63; // value × 10
-const FIELD_IDLE_RPM: usize = 64; // value × 10
+use moza_rev::codemasters_legacy::{DEFAULT_PORT, PACKET_BYTES, Telemetry};
 
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -97,69 +73,35 @@ fn main() -> ExitCode {
 }
 
 fn log_packet(buf: &[u8]) {
-    if buf.len() < MIN_BYTES_FOR_RPM {
+    if buf.len() < PACKET_BYTES {
         info!(
-            "short packet ({} bytes) — enable extradata=3 for full data",
+            "short packet ({} bytes) — set extradata=3 for the full {PACKET_BYTES}-byte packet",
             buf.len()
         );
+        // Still log what we can, with trailing fields zeroed.
+        log_telemetry(&Telemetry::from_bytes_partial(buf));
         return;
     }
+    if let Some(t) = Telemetry::from_bytes(buf) {
+        log_telemetry(&t);
+    }
+}
 
-    let rpm = (read_f32(buf, FIELD_RPM) * 10.0) as i32;
-    let max_rpm = (read_f32(buf, FIELD_MAX_RPM) * 10.0) as i32;
-    let idle_rpm = (read_f32(buf, FIELD_IDLE_RPM) * 10.0) as i32;
-    let gear = read_f32(buf, FIELD_GEAR) as i32;
-    let throttle = read_f32(buf, FIELD_THROTTLE);
-    let brake = read_f32(buf, FIELD_BRAKE);
-    let clutch = read_f32(buf, FIELD_CLUTCH);
-    let speed_kmh = read_f32(buf, FIELD_SPEED_MS) * 3.6;
-    let lap = read_f32(buf, FIELD_CURRENT_LAP) as i32;
-    let total_laps = read_f32(buf, FIELD_TOTAL_LAPS) as i32;
-    let pos = read_f32(buf, FIELD_CAR_POS) as i32;
-    let lap_time = read_f32(buf, FIELD_LAP_TIME);
-    let _ = (
-        read_f32(buf, FIELD_RUN_TIME),
-        read_f32(buf, FIELD_DISTANCE),
-        read_f32(buf, FIELD_STEERING),
-        read_f32(buf, FIELD_LAPS_COMPLETED),
-    );
-
+fn log_telemetry(t: &Telemetry) {
     info!(
-        "rpm={rpm}/{max_rpm} (idle {idle_rpm}) gear={} thr={:>3.0}% brk={:>3.0}% clu={:>3.0}% \
-         speed={:>5.1}km/h pos={pos} lap={lap}/{total_laps} laptime={:.2}s",
-        gear_label(gear),
-        throttle * 100.0,
-        brake * 100.0,
-        clutch * 100.0,
-        speed_kmh,
-        lap_time,
+        "rpm={}/{} (idle {}) gear={} thr={:>3.0}% brk={:>3.0}% clu={:>3.0}% \
+         speed={:>5.1}km/h pos={} lap={}/{} laptime={:.2}s",
+        t.rpm(),
+        t.redline_rpm(),
+        t.idle_rpm(),
+        t.gear_label(),
+        { t.throttle * 100.0 },
+        { t.brake * 100.0 },
+        { t.clutch * 100.0 },
+        t.speed_kmh(),
+        { t.car_pos as i32 },
+        { t.current_lap as i32 },
+        { t.total_laps as i32 },
+        { t.lap_time },
     );
-}
-
-fn read_f32(buf: &[u8], field_idx: usize) -> f32 {
-    let off = field_idx * 4;
-    f32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
-}
-
-fn gear_label(gear: i32) -> String {
-    // Codemasters convention: 0 = N/R, gear values go 0..=max_gears.
-    match gear {
-        0 => "N".to_string(),
-        n if n < 0 => "R".to_string(),
-        n => n.to_string(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn read_f32_decodes_le_bytes() {
-        // Field 37 (RPM): write 700.0 (= 7000 RPM after ×10)
-        let mut buf = vec![0u8; 264];
-        let off = FIELD_RPM * 4;
-        buf[off..off + 4].copy_from_slice(&700.0f32.to_le_bytes());
-        assert_eq!(read_f32(&buf, FIELD_RPM), 700.0);
-    }
 }
