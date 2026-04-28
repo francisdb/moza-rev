@@ -11,11 +11,22 @@ use log::{debug, error, info, warn};
 use moza_rev::codemasters_legacy::{self, Telemetry};
 use moza_rev::configure;
 use moza_rev::moza::{self, BaseTemps, Moza, Protocol};
+use moza_rev::outgauge;
 use moza_rev::wreckfest::{self, EngineState};
 
 const DEFAULT_WF2_PORT: u16 = 23123;
 const DEFAULT_DR2_PORT: u16 = codemasters_legacy::DEFAULT_PORT; // 20777
+const DEFAULT_BEAMNG_PORT: u16 = outgauge::DEFAULT_PORT; // 4444
 const DEFAULT_LED_COUNT: usize = 10;
+
+/// OutGauge doesn't ship max-RPM, so we adaptively track the highest
+/// RPM seen in the BeamNG session. Start sane for typical petrol cars
+/// (~7000 redline) so the bar lights up reasonably even before the
+/// driver has revved high.
+const BEAMNG_INITIAL_REDLINE: f32 = 7000.0;
+/// And no idle either. Most petrol engines idle at ~700-900 RPM; below
+/// this we treat as engine off and skip frames.
+const BEAMNG_ASSUMED_IDLE: i32 = 800;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
 const STATUS_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -44,6 +55,9 @@ enum GameId {
     /// Any Codemasters EGO-engine title using the "extradata" UDP format
     /// (DiRT 2/3/Showdown, F1 2010-2017, GRID series, DiRT Rally, DR2).
     CodemastersLegacy,
+    /// BeamNG.drive (also Live For Speed and other LFS-OutGauge-compat
+    /// titles, as long as they target the same UDP port).
+    BeamNG,
 }
 
 impl GameId {
@@ -51,6 +65,7 @@ impl GameId {
         match self {
             GameId::Wreckfest2 => "WF2",
             GameId::CodemastersLegacy => "DR2",
+            GameId::BeamNG => "BNG",
         }
     }
 }
@@ -104,7 +119,10 @@ fn main() -> ExitCode {
     if !spawn_listener(args.wf2_port, GameId::Wreckfest2, tx.clone()) {
         return ExitCode::FAILURE;
     }
-    if !spawn_listener(args.dr2_port, GameId::CodemastersLegacy, tx) {
+    if !spawn_listener(args.dr2_port, GameId::CodemastersLegacy, tx.clone()) {
+        return ExitCode::FAILURE;
+    }
+    if !spawn_beamng_listener(args.beamng_port, tx) {
         return ExitCode::FAILURE;
     }
 
@@ -245,6 +263,69 @@ fn parse(game: GameId, buf: &[u8]) -> Option<EngineState> {
                 rpm_idle: t.idle_rpm(),
             })
         }
+        // BeamNG runs on a separate listener that maintains adaptive
+        // redline state — see `listener_loop_outgauge`.
+        GameId::BeamNG => None,
+    }
+}
+
+/// BeamNG's OutGauge format gives us current RPM but no redline or idle
+/// values. We track the highest RPM seen in the session and use that as
+/// an adaptive redline; idle is fixed at a typical petrol-car value.
+/// This means the LED bar self-tunes after a few revs of the engine.
+fn spawn_beamng_listener(port: u16, tx: mpsc::Sender<Update>) -> bool {
+    let bind_addr = format!("0.0.0.0:{port}");
+    let socket = match UdpSocket::bind(&bind_addr) {
+        Ok(s) => s,
+        Err(e) => {
+            error!("bind BNG {bind_addr}: {e}");
+            return false;
+        }
+    };
+    info!("listening for BNG telemetry on udp://{bind_addr}");
+    thread::Builder::new()
+        .name("listener-BNG".to_string())
+        .spawn(move || listener_loop_outgauge(socket, tx))
+        .expect("failed to spawn BNG listener thread");
+    true
+}
+
+fn listener_loop_outgauge(socket: UdpSocket, tx: mpsc::Sender<Update>) {
+    let mut max_rpm: f32 = BEAMNG_INITIAL_REDLINE;
+    let mut buf = vec![0u8; 256];
+    loop {
+        let n = match socket.recv(&mut buf) {
+            Ok(n) => n,
+            Err(e) => {
+                error!("BNG recv: {e}");
+                continue;
+            }
+        };
+        let Some(packet) = outgauge::Packet::from_bytes(&buf[..n]) else {
+            continue;
+        };
+        let rpm_f = { packet.rpm };
+        // Skip when engine is off / car not loaded.
+        if rpm_f <= 1.0 {
+            continue;
+        }
+        if rpm_f > max_rpm {
+            max_rpm = rpm_f;
+        }
+        let engine = EngineState {
+            rpm: rpm_f as i32,
+            rpm_redline: max_rpm as i32,
+            rpm_idle: BEAMNG_ASSUMED_IDLE,
+        };
+        if tx
+            .send(Update {
+                game: GameId::BeamNG,
+                engine,
+            })
+            .is_err()
+        {
+            return;
+        }
     }
 }
 
@@ -343,6 +424,7 @@ fn rpm_to_bitmask(engine: &EngineState, led_count: usize) -> u32 {
 struct Args {
     wf2_port: u16,
     dr2_port: u16,
+    beamng_port: u16,
     serial_path: Option<String>,
     led_count: usize,
     protocol: Option<Protocol>,
@@ -353,6 +435,7 @@ impl Args {
     fn from_env() -> Result<Self, String> {
         let mut wf2_port = DEFAULT_WF2_PORT;
         let mut dr2_port = DEFAULT_DR2_PORT;
+        let mut beamng_port = DEFAULT_BEAMNG_PORT;
         let mut serial_path = None;
         let mut led_count = DEFAULT_LED_COUNT;
         let mut protocol = None;
@@ -368,6 +451,10 @@ impl Args {
                 "--dr2-port" => {
                     let v = it.next().ok_or("--dr2-port needs a value")?;
                     dr2_port = v.parse().map_err(|_| format!("invalid port: {v}"))?;
+                }
+                "--beamng-port" => {
+                    let v = it.next().ok_or("--beamng-port needs a value")?;
+                    beamng_port = v.parse().map_err(|_| format!("invalid port: {v}"))?;
                 }
                 "--serial" | "-s" => {
                     serial_path = Some(it.next().ok_or("--serial needs a path")?);
@@ -401,6 +488,7 @@ impl Args {
         Ok(Self {
             wf2_port,
             dr2_port,
+            beamng_port,
             serial_path,
             led_count,
             protocol,
@@ -413,13 +501,15 @@ fn print_usage() {
     eprintln!(
         "moza-rev — drive the Moza wheel's RPM LED bar from game telemetry\n\
          \n\
-         usage: moza-rev [--wf2-port PORT] [--dr2-port PORT] [--serial /dev/ttyACMx]\n\
-                          [--leds N] [--protocol modern|legacy] [-v]\n\
+         usage: moza-rev [--wf2-port PORT] [--dr2-port PORT] [--beamng-port PORT]\n\
+                          [--serial /dev/ttyACMx] [--leds N]\n\
+                          [--protocol modern|legacy] [-v]\n\
                 moza-rev configure   # detect installed games and offer to enable telemetry\n\
          \n\
          defaults: --wf2-port {DEFAULT_WF2_PORT} (Wreckfest 2 \"Pino\")\n\
                    --dr2-port {DEFAULT_DR2_PORT} (Codemasters legacy: DR2, DR1, F1 2010-2017,\n\
                                                   Dirt 2/3/Showdown, GRID series)\n\
+                   --beamng-port {DEFAULT_BEAMNG_PORT} (BeamNG.drive OutGauge / LFS)\n\
                    --leds {DEFAULT_LED_COUNT}, serial+protocol autodetected.\n\
          \n\
          Both listeners run simultaneously. The active game is whichever\n\

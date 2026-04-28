@@ -96,6 +96,14 @@ Find the `<motion_platform>` block and set:
 
 The same parser handles **any Codemasters EGO-engine title using the legacy "extradata" UDP format**: DiRT 2 / 3 / Showdown, F1 2010-2017, GRID / GRID 2 / GRID Autosport, DiRT Rally, DiRT Rally 2.0. Just point the game at port 20777 and it will be picked up automatically.
 
+### BeamNG.drive
+
+Telemetry is off by default. Enable OutGauge in `Options → Other → Protocols`: tick OutGauge, set IP `127.0.0.1`, port `4444`. Or run `cargo run -- configure` and accept the prompt — it edits the right key in BeamNG's `cloud/settings.json`.
+
+Caveat: OutGauge doesn't transmit the redline RPM, only current RPM. moza-rev tracks the highest RPM observed per session and uses that as an adaptive redline (initial assumption: 7000 RPM, idle: 800 RPM). The bar will self-tune after a few revs.
+
+The same listener also handles **Live For Speed** and any other LFS-OutGauge-compatible title pointed at port 4444.
+
 ## Logging
 
 Uses `env_logger`. Default level is `info`. Override with `RUST_LOG`:
