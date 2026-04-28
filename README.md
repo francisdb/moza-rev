@@ -41,6 +41,7 @@ cargo run --example blast 1023   # full bar at sustained rate; sanity-check the 
 cargo run --example logcat       # dump every protocol frame seen on the bus
 cargo run --example diagnose     # probe wheel settings (RPM mode, indicator mode, etc.)
 cargo run --example wf2_log      # log a one-line summary per Wreckfest 2 telemetry packet
+cargo run --example dr2_log      # log a one-line summary per DiRT Rally 2.0 telemetry packet
 ```
 
 ## Tested devices
@@ -62,6 +63,26 @@ Telemetry is off by default. Edit the game's `config.json` and set `"enabled": 1
 For native Steam installs the prefix replaces `~/.var/app/com.valvesoftware.Steam/.local/share/Steam` with `~/.steam/steam`.
 
 Default UDP port is `23123` — matches `moza-rev`'s default. Override with `--port` on either side if needed.
+
+### DiRT Rally 2.0
+
+Telemetry is off by default. Edit `hardware_settings_config.xml` and flip the `<udp>` element's `enabled` to `"true"` and `extradata` to `"3"`. On Steam (Flatpak) the file lives at:
+
+```
+~/.var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/compatdata/690790/pfx/drive_c/users/steamuser/Documents/My Games/DiRT Rally 2.0/hardwaresettings/hardware_settings_config.xml
+```
+
+For native Steam installs the prefix replaces `~/.var/app/com.valvesoftware.Steam/.local/share/Steam` with `~/.steam/steam`.
+
+Find the `<motion_platform>` block and set:
+
+```xml
+<udp enabled="true" extradata="3" ip="127.0.0.1" port="20777" delay="1" />
+```
+
+`extradata=3` is what gives you the full 264-byte packet with RPM, redline, and idle RPM. Lower values send a shorter packet and `dr2_log` will warn that fields are missing. Default UDP port is `20777` — Codemasters' standard.
+
+Note: only `moza-rev`'s `dr2_log` example currently consumes this. Wiring DR2 telemetry into the main LED-driver binary requires a separate parser module — not done yet.
 
 ## Logging
 
