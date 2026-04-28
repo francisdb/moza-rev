@@ -1,5 +1,5 @@
 use std::env;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::net::UdpSocket;
 use std::process::ExitCode;
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -126,6 +126,11 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // Only do the in-place `\r` rewrite when stdout is a real TTY. Piped
+    // output (`moza-rev | tee log.txt`, systemd, journald, etc.) gets
+    // newline-terminated lines instead.
+    let inplace_status = !args.verbose && std::io::stdout().is_terminal();
+
     let mut last_bitmask: Option<u32> = None;
     let mut last_send = Instant::now();
     let mut last_status = Instant::now();
@@ -187,7 +192,7 @@ fn main() -> ExitCode {
                 bitmask,
                 args.led_count,
                 packets_since_status,
-                true,
+                false, // verbose: one line per packet, never overwrite
             );
             packets_since_status = 0;
         } else if last_status.elapsed() >= STATUS_INTERVAL {
@@ -197,7 +202,7 @@ fn main() -> ExitCode {
                 bitmask,
                 args.led_count,
                 packets_since_status,
-                false,
+                inplace_status,
             );
             last_status = Instant::now();
             packets_since_status = 0;
@@ -370,7 +375,7 @@ fn print_status(
     bitmask: u32,
     led_count: usize,
     packets: u32,
-    verbose: bool,
+    inplace: bool,
 ) {
     let bar = led_bar(bitmask, led_count);
     let line = format!(
@@ -382,12 +387,13 @@ fn print_status(
         bar,
         packets
     );
-    if verbose {
-        println!("{line}");
-    } else {
-        // Overwrite a single status line in place.
+    if inplace {
+        // Overwrite a single status line in place; trailing spaces clear
+        // any leftover from a previous longer line.
         print!("\r{line}    ");
         let _ = std::io::stdout().flush();
+    } else {
+        println!("{line}");
     }
 }
 
