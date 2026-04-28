@@ -88,6 +88,7 @@ cargo run --example diagnose     # probe wheel settings (RPM mode, indicator mod
 cargo run --example wf2_log      # one-line summary per Wreckfest 2 telemetry packet
 cargo run --example dr2_log      # one-line summary per Codemasters EGO packet
 cargo run --example beamng_log   # one-line summary per OutGauge packet
+cargo run --example ams2_log     # one-line summary per AMS2 / PC2 telemetry packet
 ```
 
 ## Logging
