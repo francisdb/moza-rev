@@ -152,20 +152,30 @@ pub fn run(args: ListenArgs) -> ExitCode {
     let user_serial = args.serial.clone();
     let user_protocol = args.protocol.map(Protocol::from);
 
-    let (serial_path, protocol, initial_wheel) =
-        match open_wheel(user_serial.as_deref(), user_protocol) {
-            Some(t) => t,
-            None => {
-                error!(
-                    "no Moza wheelbase found under /dev/serial/by-id/ (looking for *Gudsen*Base*). \
-                     plug it in, or pass --serial /dev/ttyACMx"
-                );
-                return ExitCode::FAILURE;
-            }
-        };
-    info!("opening Moza wheelbase at {serial_path} ({protocol:?} protocol)");
-    let mut wheel: Option<Moza> = Some(initial_wheel);
-    let mut last_reconnect = Instant::now();
+    // Try to open the wheel once at startup, but don't make it fatal —
+    // a systemd service may launch before the wheel is plugged in. The
+    // main loop's reconnect cycle picks it up whenever it appears.
+    let (mut wheel, mut last_reconnect) = match open_wheel(user_serial.as_deref(), user_protocol) {
+        Some((path, protocol, w)) => {
+            info!("Moza wheelbase connected at {path} ({protocol:?} protocol)");
+            (Some(w), Instant::now())
+        }
+        None => {
+            warn!(
+                "no Moza wheelbase found yet — will keep retrying every {}s. \
+                 plug it in, or pass --serial /dev/ttyACMx to pin a path",
+                RECONNECT_INTERVAL.as_secs()
+            );
+            // Make the first reconnect attempt fire on the very next loop
+            // tick rather than waiting a full interval.
+            (
+                None,
+                Instant::now()
+                    .checked_sub(RECONNECT_INTERVAL)
+                    .unwrap_or_else(Instant::now),
+            )
+        }
+    };
 
     let (tx, rx) = mpsc::channel::<Update>();
     if !spawn_listener(args.wf2_port, GameId::Wreckfest2, tx.clone()) {
@@ -204,7 +214,7 @@ pub fn run(args: ListenArgs) -> ExitCode {
         // be noisy. The transition log is in `open_wheel`'s caller.
         if wheel.is_none() && last_reconnect.elapsed() >= RECONNECT_INTERVAL {
             if let Some((path, _, w)) = open_wheel(user_serial.as_deref(), user_protocol) {
-                info!("Moza wheelbase reconnected at {path}");
+                info!("Moza wheelbase connected at {path}");
                 wheel = Some(w);
                 // Force the next heartbeat to re-send the bitmask so the
                 // bar matches engine state immediately rather than waiting
@@ -582,7 +592,7 @@ fn try_write(
     match w.send_rpm_bitmask(bitmask, led_count) {
         Ok(()) => Some(w),
         Err(e) => {
-            warn!("Moza wheelbase write failed ({e}); will retry to reconnect");
+            warn!("Moza wheelbase write failed ({e}); will retry to connect");
             *last_reconnect = Instant::now();
             None
         }
