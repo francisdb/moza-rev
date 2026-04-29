@@ -89,7 +89,10 @@ fn main() -> ExitCode {
     }
     info!(
         "connecting to AC at udp://{target} from {}",
-        socket.local_addr().map(|a| a.to_string()).unwrap_or_default()
+        socket
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_default()
     );
 
     // Handshake.
@@ -115,9 +118,7 @@ fn main() -> ExitCode {
         }
     };
     let Some(hs) = HandshakeResponse::from_bytes(&buf[..n]) else {
-        error!(
-            "handshake reply too short: got {n} bytes, expected {HANDSHAKE_RESPONSE_BYTES}"
-        );
+        error!("handshake reply too short: got {n} bytes, expected {HANDSHAKE_RESPONSE_BYTES}");
         return ExitCode::FAILURE;
     };
     info!(

@@ -9,6 +9,9 @@
 
 use std::ptr;
 
+/// Default UDP port the game's telemetry config uses out of the box.
+pub const DEFAULT_PORT: u16 = 23123;
+
 /// Magic value at offset 0 of every Pino packet. Verbatim from the C header
 /// (`const U32 signature = 1869769584`). Note: "Pino" is just the protocol's
 /// internal codename — the actual little-endian bytes are `70 6B 72 6F`, not

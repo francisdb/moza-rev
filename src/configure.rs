@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use crate::{assetto_corsa, madness, outgauge};
+
 /// ANSI styling for the configure output — bold/cyan game titles, green
 /// ✓, red ✘, yellow ⚠. Auto-disabled when stdout isn't a terminal or
 /// when `NO_COLOR` is set (https://no-color.org).
@@ -34,13 +36,25 @@ mod style {
         }
     }
     pub fn ok() -> &'static str {
-        if enabled() { "\x1b[32m✓\x1b[0m" } else { "✓" }
+        if enabled() {
+            "\x1b[32m✓\x1b[0m"
+        } else {
+            "✓"
+        }
     }
     pub fn cross() -> &'static str {
-        if enabled() { "\x1b[31m✘\x1b[0m" } else { "✘" }
+        if enabled() {
+            "\x1b[31m✘\x1b[0m"
+        } else {
+            "✘"
+        }
     }
     pub fn warn() -> &'static str {
-        if enabled() { "\x1b[33m⚠\x1b[0m" } else { "⚠" }
+        if enabled() {
+            "\x1b[33m⚠\x1b[0m"
+        } else {
+            "⚠"
+        }
     }
 }
 
@@ -52,9 +66,6 @@ const BEAMNG_APP_ID: &str = "284160";
 const AMS2_APP_ID: &str = "1066890";
 const AC_APP_ID: &str = "244210";
 const AC_INSTALL_DIR: &str = "assettocorsa";
-
-const AMS2_DEFAULT_PORT: u16 = 5606;
-const AC_DEFAULT_PORT: u16 = 9996;
 
 /// Detect-only — these run on EGO/proprietary engines without native UDP
 /// telemetry; the only path is memory injection (SpaceMonkey on Windows).
@@ -269,7 +280,10 @@ fn handle_wf2() -> io::Result<()> {
     );
 
     if current_enabled == 1 {
-        println!("  {} telemetry already enabled — no changes needed.\n", style::ok());
+        println!(
+            "  {} telemetry already enabled — no changes needed.\n",
+            style::ok()
+        );
         return Ok(());
     }
 
@@ -440,22 +454,23 @@ fn rewrite_xml_attrs(element: &str, updates: &[(&str, &str)]) -> String {
 //
 
 fn handle_ams2() {
+    let port = madness::DEFAULT_PORT;
     println!("{}", style::title("Automobilista 2"));
-    println!("  Has UDP telemetry on port {AMS2_DEFAULT_PORT} using the Project CARS 2 format.");
+    println!("  Has UDP telemetry on port {port} using the Project CARS 2 format.");
     println!("  In game: Options → System → UDP Protocol Version: Project CARS 2,");
     println!("                              UDP Frequency: 1+");
     println!("  (Settings live in encrypted .sav files; can't auto-edit.)");
 
-    match probe_broadcast_loopback(AMS2_DEFAULT_PORT) {
+    match probe_broadcast_loopback(port) {
         ProbeResult::LoopbackWorks => {
             println!(
-                "  {} broadcast loopback works on port {AMS2_DEFAULT_PORT} — game traffic will reach moza-rev.",
+                "  {} broadcast loopback works on port {port} — game traffic will reach moza-rev.",
                 style::ok()
             );
         }
         ProbeResult::NoLoopback => {
             println!(
-                "  {} broadcast loopback NOT working on port {AMS2_DEFAULT_PORT} — game traffic won't reach moza-rev.",
+                "  {} broadcast loopback NOT working on port {port} — game traffic won't reach moza-rev.",
                 style::cross()
             );
             println!(
@@ -463,12 +478,15 @@ fn handle_ams2() {
             );
             println!("    Apply this iptables NAT redirect (one-time, reversible with -D):");
             println!(
-                "      sudo iptables -t nat -I OUTPUT -p udp -d 255.255.255.255 --dport {AMS2_DEFAULT_PORT} \\"
+                "      sudo iptables -t nat -I OUTPUT -p udp -d 255.255.255.255 --dport {port} \\"
             );
-            println!("        -j DNAT --to-destination 127.0.0.1:{AMS2_DEFAULT_PORT}");
+            println!("        -j DNAT --to-destination 127.0.0.1:{port}");
         }
         ProbeResult::CouldNotProbe(reason) => {
-            println!("  {} couldn't check broadcast loopback: {reason}", style::warn());
+            println!(
+                "  {} couldn't check broadcast loopback: {reason}",
+                style::warn()
+            );
         }
     }
     println!();
@@ -541,7 +559,9 @@ fn probe_broadcast_loopback(port: u16) -> ProbeResult {
 // BeamNG.drive — JSON config under XDG data, not Steam compatdata
 //
 
-const BEAMNG_DEFAULT_PORT: i64 = 4444;
+/// `serde_json::Value::as_i64` returns i64, so widen the protocol's u16
+/// at compile time rather than at every call site.
+const BEAMNG_DEFAULT_PORT: i64 = outgauge::DEFAULT_PORT as i64;
 const BEAMNG_DEFAULT_ADDRESS: &str = "127.0.0.1";
 
 /// BeamNG.drive writes its settings outside the Steam Wine prefix, into the
@@ -590,7 +610,10 @@ fn handle_beamng() -> io::Result<()> {
     );
 
     if current_enabled {
-        println!("  {} OutGauge already enabled — no changes needed.", style::ok());
+        println!(
+            "  {} OutGauge already enabled — no changes needed.",
+            style::ok()
+        );
         println!();
         return Ok(());
     }
@@ -630,10 +653,9 @@ fn handle_beamng() -> io::Result<()> {
 //
 
 fn handle_ac() -> io::Result<()> {
+    let port = assetto_corsa::DEFAULT_PORT;
     println!("{}", style::title("Assetto Corsa"));
-    println!(
-        "  UDP telemetry needs no in-game setup — port {AC_DEFAULT_PORT} is always listening"
-    );
+    println!("  UDP telemetry needs no in-game setup — port {port} is always listening");
     println!("  once a session is loaded.");
 
     let Some(install) = steam_install_path(AC_INSTALL_DIR) else {
@@ -651,18 +673,10 @@ fn handle_ac() -> io::Result<()> {
         return Ok(());
     }
 
-    println!(
-        "  AC's stock launcher (AssettoCorsa.exe) often fails on current Wine/Proton with"
-    );
-    println!(
-        "  a CEF3/.NET assembly load error. Workaround: add acs.exe as a non-Steam game"
-    );
-    println!(
-        "  forced to a stable Proton. That direct launch then needs a steam_appid.txt"
-    );
-    println!(
-        "  next to the binary, or acs.exe exits ~2s after start with no error message."
-    );
+    println!("  AC's stock launcher (AssettoCorsa.exe) often fails on current Wine/Proton with");
+    println!("  a CEF3/.NET assembly load error. Workaround: add acs.exe as a non-Steam game");
+    println!("  forced to a stable Proton. That direct launch then needs a steam_appid.txt");
+    println!("  next to the binary, or acs.exe exits ~2s after start with no error message.");
     println!(
         "  proposed: write \"{AC_APP_ID}\" to {}",
         appid_file.display()

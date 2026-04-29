@@ -12,9 +12,7 @@ use std::process::ExitCode;
 
 use log::{error, info};
 
-use moza_rev::wreckfest::{self, Packet, ParticipantStatus, SessionStatus};
-
-const DEFAULT_PORT: u16 = 23123;
+use moza_rev::wreckfest::{self, DEFAULT_PORT, Packet, ParticipantStatus, SessionStatus};
 
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
