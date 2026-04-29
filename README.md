@@ -22,7 +22,7 @@ Other Moza wheelbases should work via the modern protocol path (auto-selected fr
 
 ## Supported games
 
-A single `cargo run` binds three UDP listeners simultaneously and routes whichever is active to the LEDs. The status line tag (`[WF2]`, `[DR2]`, `[BNG]`) shows the current source; the wheel reverts to its idle breathing pattern after 2 s without telemetry.
+A single `cargo run` opens all per-game telemetry sources simultaneously and routes whichever is active to the LEDs. The status line tag (`[WF2]`, `[DR2]`, `[BNG]`, `[AMS2]`, `[AC]`) shows the current source; the wheel reverts to its idle breathing pattern after 2 s without telemetry.
 
 | Game | UDP port | `configure` | Notes |
 |------|----------|-------------|-------|
@@ -33,6 +33,8 @@ A single `cargo run` binds three UDP listeners simultaneously and routes whichev
 | BeamNG.drive | 4444 | ✓ auto | LFS-OutGauge format |
 | Live For Speed (and other OutGauge clients) | 4444 | manual | Same listener |
 | Automobilista 2 / Project CARS 2 | 5606 | manual ² | Requires Linux loopback fix ²ʹ |
+| Assetto Corsa 1 | 9996 | always on ³ | Handshake-based; adaptive redline |
+| Assetto Corsa Competizione, Assetto Corsa Rally | — | flagged | Detected but not yet parsed (ACC has a UDP API; ACR hasn't shipped one) |
 | Wreckfest 1, DIRT 5 | — | flagged | No native UDP — would need [SpaceMonkey](https://github.com/PHARTGAMES/SpaceMonkey) under Wine |
 
 ¹ DiRT 2 / 3, F1 2010-2017, GRID / GRID 2 / GRID Autosport, DiRT Rally 1.0 all share the same UDP format on port 20777 and should work, but haven't been individually verified.
@@ -40,6 +42,8 @@ A single `cargo run` binds three UDP listeners simultaneously and routes whichev
 ² AMS2 stores its UI settings in encrypted `.sav` files that we can't safely edit, so configure-time setup is in-game only.
 
 ²ʹ See the **AMS2 / PC2** subsection below for the iptables one-liner needed on Linux.
+
+³ AC's UDP listener is unconditionally on once a session is loaded — no telemetry toggles. `configure` instead offers to write `steam_appid.txt` next to `acs.exe` to fix the standard Proton launcher workaround (see the **Assetto Corsa** subsection).
 
 ## Setup details
 
@@ -71,7 +75,15 @@ sudo iptables -t nat -I OUTPUT -p udp -d 255.255.255.255 --dport 5606 -j DNAT --
 
 This is reversible (`-D` instead of `-I` to remove). Side effect: packets stop going out on the LAN — fine for same-machine telemetry, breaks dual-machine setups.
 
-The same workaround applies to any other Madness-engine title (PC2, PC3) and likely Assetto Corsa / ACC if you ever wire those up — UDP-broadcast-on-Linux behaves the same way regardless of the game.
+The same workaround applies to any other Madness-engine title (PC2, PC3). Assetto Corsa 1 doesn't need it — its protocol is request/response (handshake to `127.0.0.1:9996`), so the kernel never has to loop a broadcast.
+
+### Assetto Corsa
+
+UDP telemetry on port 9996 is unconditionally on once a session is loaded — there's no in-game toggle. moza-rev sends a Handshake to AC, gets back the car / track / driver, then subscribes to per-physics-step `RTCarInfo` (~333 Hz, forwarded to the LED loop at ~60 Hz). On menu return / quit the stream goes silent and the listener falls back to handshake retries every 3 s, so it doesn't matter whether AC or moza-rev started first.
+
+Caveat — same as BeamNG: AC's `RTCarInfo` doesn't carry a redline, so moza-rev tracks the highest RPM seen in the session and uses that as an effective redline (initial 7000, idle 800). The bar self-tunes after a few revs.
+
+Linux launcher caveat: AC's stock launcher (`AssettoCorsa.exe`, .NET WPF + CEF3) often fails on current Wine/Proton with an assembly-load error. The standard workaround is to add `acs.exe` (the actual game binary, in the install root) as a non-Steam shortcut and force a stable Proton on it. That direct launch then needs a `steam_appid.txt` containing `244210` next to `acs.exe`, or `acs.exe` exits ~2 s after start with no error message. `moza-rev configure` offers to write that file.
 
 ## Prerequisites
 
@@ -90,7 +102,9 @@ Useful flags:
 ```sh
 --wf2-port    23123      # change Wreckfest 2 UDP port
 --dr2-port    20777      # change Codemasters legacy UDP port
+--ams2-port   5606       # change AMS2 / PC2 (Madness) UDP port
 --beamng-port 4444       # change BeamNG OutGauge UDP port
+--ac-port     9996       # change Assetto Corsa UDP port
 --serial /dev/ttyACM0    # override the autodetected serial path
 --leds 10                # number of LEDs on the wheel
 --protocol legacy        # force legacy (R3/R5/ES); modern is default
@@ -108,6 +122,7 @@ cargo run --example wreckfest_2_log      # one-line summary per Wreckfest 2 tele
 cargo run --example dirt_rally_2_log     # one-line summary per Codemasters EGO packet
 cargo run --example beamng_log           # one-line summary per OutGauge packet
 cargo run --example automobilista_2_log  # one-line summary per AMS2 / PC2 telemetry packet
+cargo run --example assetto_corsa_log    # handshake + one-line summary per RTCarInfo packet
 ```
 
 ## Logging
