@@ -94,6 +94,7 @@ enum GameId {
 }
 
 impl GameId {
+    /// Compact tag for the per-tick status line (`[WF2]`, `[AC]`, …).
     fn label(self) -> &'static str {
         match self {
             GameId::Wreckfest2 => "WF2",
@@ -101,6 +102,17 @@ impl GameId {
             GameId::BeamNG => "BNG",
             GameId::Ams2 => "AMS2",
             GameId::AssettoCorsa => "AC",
+        }
+    }
+
+    /// Full name for startup / lifecycle log lines.
+    fn name(self) -> &'static str {
+        match self {
+            GameId::Wreckfest2 => "Wreckfest 2",
+            GameId::CodemastersLegacy => "Codemasters EGO (DR2 / DiRT / F1 / GRID)",
+            GameId::BeamNG => "BeamNG.drive",
+            GameId::Ams2 => "Automobilista 2 / Project CARS 2",
+            GameId::AssettoCorsa => "Assetto Corsa",
         }
     }
 }
@@ -206,7 +218,7 @@ fn main() -> ExitCode {
         };
 
         if active_game != Some(update.game) {
-            info!("active game: {}", update.game.label());
+            info!("active game: {}", update.game.name());
             active_game = Some(update.game);
         }
         last_packet_at = Some(Instant::now());
@@ -263,7 +275,7 @@ fn spawn_listener(port: u16, game: GameId, tx: mpsc::Sender<Update>) -> bool {
     };
     info!(
         "listening for {} telemetry on udp://{bind_addr}",
-        game.label()
+        game.name()
     );
     thread::Builder::new()
         .name(format!("listener-{}", game.label()))
@@ -342,9 +354,12 @@ fn spawn_beamng_listener(port: u16, tx: mpsc::Sender<Update>) -> bool {
             return false;
         }
     };
-    info!("listening for BNG telemetry on udp://{bind_addr}");
+    info!(
+        "listening for {} telemetry on udp://{bind_addr}",
+        GameId::BeamNG.name()
+    );
     thread::Builder::new()
-        .name("listener-BNG".to_string())
+        .name(format!("listener-{}", GameId::BeamNG.label()))
         .spawn(move || listener_loop_outgauge(socket, tx))
         .expect("failed to spawn BNG listener thread");
     true
@@ -397,10 +412,13 @@ fn listener_loop_outgauge(socket: UdpSocket, tx: mpsc::Sender<Update>) {
 /// field, so we adapt like BeamNG does.
 fn spawn_ac_listener(port: u16, tx: mpsc::Sender<Update>) {
     let target = format!("127.0.0.1:{port}");
-    info!("listening for AC telemetry via udp://{target} (handshake retry every {}s)",
-          AC_HANDSHAKE_RETRY.as_secs());
+    info!(
+        "listening for {} telemetry via udp://{target} (handshake retry every {}s)",
+        GameId::AssettoCorsa.name(),
+        AC_HANDSHAKE_RETRY.as_secs()
+    );
     thread::Builder::new()
-        .name("listener-AC".to_string())
+        .name(format!("listener-{}", GameId::AssettoCorsa.label()))
         .spawn(move || listener_loop_ac(target, tx))
         .expect("failed to spawn AC listener thread");
 }
