@@ -57,6 +57,11 @@ const AC_FORWARD_INTERVAL: Duration = Duration::from_millis(16);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
 const STATUS_INTERVAL: Duration = Duration::from_millis(500);
 
+/// How often to retry opening the wheelbase after a disconnect. Linux
+/// renumbers `/dev/ttyACMx` on replug, so each retry re-runs the
+/// autodetection (unless the user pinned `--serial`).
+const RECONNECT_INTERVAL: Duration = Duration::from_secs(3);
+
 /// Time without a packet from the active game before we revert to "no game"
 /// and clear the LED bar.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -121,29 +126,46 @@ struct Update {
     engine: EngineState,
 }
 
-pub fn run(args: ListenArgs) -> ExitCode {
-    let serial_path = match args.serial.or_else(moza::find_wheelbase) {
-        Some(p) => p,
-        None => {
-            error!(
-                "no Moza wheelbase found under /dev/serial/by-id/ (looking for *Gudsen*Base*). \
-                 plug it in, or pass --serial /dev/ttyACMx"
-            );
-            return ExitCode::FAILURE;
-        }
+/// Open the Moza wheelbase, honouring an explicit `--serial` if the user
+/// supplied one or autodetecting otherwise. Returns `None` if no wheel is
+/// reachable; the caller chooses whether that's fatal (startup) or just a
+/// reconnect-attempt failure (mid-run after a USB unplug).
+fn open_wheel(
+    user_serial: Option<&str>,
+    user_protocol: Option<Protocol>,
+) -> Option<(String, Protocol, Moza)> {
+    let path = match user_serial {
+        Some(p) => p.to_string(),
+        None => moza::find_wheelbase()?,
     };
-    let protocol = args
-        .protocol
-        .map(Protocol::from)
-        .unwrap_or_else(|| moza::detect_protocol(&serial_path));
-    info!("opening Moza wheelbase at {serial_path} ({protocol:?} protocol)");
-    let mut wheel = match Moza::open(&serial_path, protocol) {
-        Ok(m) => m,
+    let protocol = user_protocol.unwrap_or_else(|| moza::detect_protocol(&path));
+    match Moza::open(&path, protocol) {
+        Ok(w) => Some((path, protocol, w)),
         Err(e) => {
-            error!("{e}");
-            return ExitCode::FAILURE;
+            debug!("open Moza at {path}: {e}");
+            None
         }
-    };
+    }
+}
+
+pub fn run(args: ListenArgs) -> ExitCode {
+    let user_serial = args.serial.clone();
+    let user_protocol = args.protocol.map(Protocol::from);
+
+    let (serial_path, protocol, initial_wheel) =
+        match open_wheel(user_serial.as_deref(), user_protocol) {
+            Some(t) => t,
+            None => {
+                error!(
+                    "no Moza wheelbase found under /dev/serial/by-id/ (looking for *Gudsen*Base*). \
+                     plug it in, or pass --serial /dev/ttyACMx"
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+    info!("opening Moza wheelbase at {serial_path} ({protocol:?} protocol)");
+    let mut wheel: Option<Moza> = Some(initial_wheel);
+    let mut last_reconnect = Instant::now();
 
     let (tx, rx) = mpsc::channel::<Update>();
     if !spawn_listener(args.wf2_port, GameId::Wreckfest2, tx.clone()) {
@@ -177,21 +199,51 @@ pub fn run(args: ListenArgs) -> ExitCode {
     let mut packets_since_status: u32 = 0;
 
     loop {
+        // Reconnect attempt if the wheel got unplugged. Quiet at debug
+        // until the open succeeds — info-level chatter every 3s would
+        // be noisy. The transition log is in `open_wheel`'s caller.
+        if wheel.is_none() && last_reconnect.elapsed() >= RECONNECT_INTERVAL {
+            if let Some((path, _, w)) = open_wheel(user_serial.as_deref(), user_protocol) {
+                info!("Moza wheelbase reconnected at {path}");
+                wheel = Some(w);
+                // Force the next heartbeat to re-send the bitmask so the
+                // bar matches engine state immediately rather than waiting
+                // for the next change.
+                last_bitmask = None;
+            }
+            last_reconnect = Instant::now();
+        }
+
         if last_temp_poll.elapsed() >= TEMP_POLL_INTERVAL {
-            poll_temps(&mut wheel);
+            if let Some(w) = wheel.as_mut() {
+                poll_temps(w);
+            }
             last_temp_poll = Instant::now();
         }
 
-        // Idle timeout: if the active game stops sending, clear the bar so
-        // the wheel returns to its breathing pattern.
+        // Idle timeout: clear the active-game state so the next heartbeat
+        // writes 0 to the bar.
         if let Some(t) = last_packet_at
             && t.elapsed() >= IDLE_TIMEOUT
             && active_game.is_some()
         {
             info!("no telemetry for {:?} — going idle", IDLE_TIMEOUT);
             active_game = None;
-            last_bitmask = None;
-            let _ = wheel.send_rpm_bitmask(0, led_count);
+        }
+
+        // Heartbeat keepalive. Always write at least once per
+        // HEARTBEAT_INTERVAL, even with no telemetry — this keeps the
+        // bar refreshed AND surfaces a USB unplug as a write error
+        // within ~1-2s, which would otherwise go unnoticed in idle mode.
+        if last_send.elapsed() >= HEARTBEAT_INTERVAL {
+            let bitmask = if active_game.is_some() {
+                last_bitmask.unwrap_or(0)
+            } else {
+                0
+            };
+            wheel = try_write(wheel.take(), bitmask, led_count, &mut last_reconnect);
+            last_bitmask = Some(bitmask);
+            last_send = Instant::now();
         }
 
         let update = match rx.recv_timeout(RECV_TIMEOUT) {
@@ -211,13 +263,8 @@ pub fn run(args: ListenArgs) -> ExitCode {
         packets_since_status += 1;
 
         let bitmask = rpm_to_bitmask(&update.engine, led_count);
-        let changed = Some(bitmask) != last_bitmask;
-        let stale = last_send.elapsed() >= HEARTBEAT_INTERVAL;
-        if changed || stale {
-            if let Err(e) = wheel.send_rpm_bitmask(bitmask, led_count) {
-                error!("write to wheel: {e}");
-                continue;
-            }
+        if Some(bitmask) != last_bitmask {
+            wheel = try_write(wheel.take(), bitmask, led_count, &mut last_reconnect);
             last_bitmask = Some(bitmask);
             last_send = Instant::now();
         }
@@ -518,6 +565,26 @@ fn listener_loop_ac(target: String, tx: mpsc::Sender<Update>) {
             {
                 return;
             }
+        }
+    }
+}
+
+/// Send a bitmask to the wheel, dropping the handle on failure so the
+/// next loop tick triggers a reconnect attempt. Returns the handle on
+/// success, `None` on failure or if `wheel` was already `None`.
+fn try_write(
+    wheel: Option<Moza>,
+    bitmask: u32,
+    led_count: usize,
+    last_reconnect: &mut Instant,
+) -> Option<Moza> {
+    let mut w = wheel?;
+    match w.send_rpm_bitmask(bitmask, led_count) {
+        Ok(()) => Some(w),
+        Err(e) => {
+            warn!("Moza wheelbase write failed ({e}); will retry to reconnect");
+            *last_reconnect = Instant::now();
+            None
         }
     }
 }
