@@ -4,15 +4,17 @@
 
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, ErrorKind, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+use serde::Serialize;
 use serde_json::Value;
+use serde_json::ser::{PrettyFormatter, Serializer};
 
-use crate::{assetto_corsa, madness, outgauge};
+use crate::{assetto_corsa, assetto_corsa_competizione, madness, outgauge};
 
 /// ANSI styling for the configure output — bold/cyan game titles, green
 /// ✓, red ✘, yellow ⚠. Auto-disabled when stdout isn't a terminal or
@@ -66,6 +68,8 @@ const BEAMNG_APP_ID: &str = "284160";
 const AMS2_APP_ID: &str = "1066890";
 const AC_APP_ID: &str = "244210";
 const AC_INSTALL_DIR: &str = "assettocorsa";
+const ACC_APP_ID: &str = "805550";
+const ACC_DEFAULT_PORT: i64 = assetto_corsa_competizione::DEFAULT_PORT as i64;
 
 /// Detect-only — these run on EGO/proprietary engines without native UDP
 /// telemetry; the only path is memory injection (SpaceMonkey on Windows).
@@ -81,23 +85,13 @@ struct ManualEntry {
     notes: &'static str,
 }
 
-const MANUAL_TELEMETRY_GAMES: &[ManualEntry] = &[
-    ManualEntry {
-        app_id: "805550",
-        name: "Assetto Corsa Competizione",
-        notes: "  Has UDP Broadcasting API (port 9000, password handshake — connection-oriented).\n  \
-                Edit Documents/Assetto Corsa Competizione/Config/broadcasting.json:\n  \
-                  udpListenerPort: 9000, connectionPassword: <set this>.\n  \
-                moza-rev does not yet have an ACC parser.",
-    },
-    ManualEntry {
-        app_id: "3917090",
-        name: "Assetto Corsa Rally",
-        notes: "  Built on Unreal Engine 5; Kunos hasn't shipped a documented UDP\n  \
-                telemetry export yet (binary strings show no protocol surface).\n  \
-                Likely arrives in a future early-access patch.",
-    },
-];
+const MANUAL_TELEMETRY_GAMES: &[ManualEntry] = &[ManualEntry {
+    app_id: "3917090",
+    name: "Assetto Corsa Rally",
+    notes: "  Built on Unreal Engine 5; Kunos hasn't shipped a documented UDP\n  \
+            telemetry export yet (binary strings show no protocol surface).\n  \
+            Likely arrives in a future early-access patch.",
+}];
 
 /// Steam library paths to search for installed games.
 fn steam_library_roots() -> Vec<PathBuf> {
@@ -192,6 +186,12 @@ pub fn run() -> ExitCode {
         any_handled = true;
         if let Err(e) = handle_ac() {
             eprintln!("Assetto Corsa: error: {e}\n");
+        }
+    }
+    if game_installed(ACC_APP_ID) {
+        any_handled = true;
+        if let Err(e) = handle_acc_competizione() {
+            eprintln!("Assetto Corsa Competizione: error: {e}\n");
         }
     }
     for entry in MANUAL_TELEMETRY_GAMES {
@@ -691,10 +691,280 @@ fn handle_ac() -> io::Result<()> {
 }
 
 //
+// Assetto Corsa Competizione — UTF-16 LE JSON
+//
+// ACC writes Documents/Assetto Corsa Competizione/Config/broadcasting.json
+// as UTF-16 LE without a BOM. Decoding to UTF-8, parsing JSON, then
+// re-encoding UTF-16 LE preserves whatever ACC will accept on its next
+// read. Broadcasting is local-only and the password's purpose is to
+// stop accidental cross-tool collisions, so we propose a memorable
+// default ("moza") rather than a random one.
+//
+
+fn handle_acc_competizione() -> io::Result<()> {
+    println!("{}", style::title("Assetto Corsa Competizione"));
+    let Some(docs) = proton_documents(ACC_APP_ID) else {
+        println!(
+            "  Installed but never launched — start the game once so it generates its config, then re-run.\n"
+        );
+        return Ok(());
+    };
+    let config_path = docs
+        .join("Assetto Corsa Competizione")
+        .join("Config")
+        .join("broadcasting.json");
+    if !config_path.exists() {
+        println!("  Couldn't find {}.\n", config_path.display());
+        return Ok(());
+    }
+
+    let bytes = fs::read(&config_path)?;
+    let raw = decode_utf16_le(&bytes)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("UTF-16 LE decode: {e}")))?;
+    let mut doc: Value = serde_json::from_str(&raw)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+
+    let current_port = doc
+        .get("updListenerPort")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let current_password = doc
+        .get("connectionPassword")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+
+    println!("  config: {}", config_path.display());
+    println!(
+        "  current: updListenerPort={current_port}, connectionPassword={}",
+        if current_password.is_empty() {
+            "(empty)".to_string()
+        } else {
+            format!("(set, {} chars)", current_password.chars().count())
+        },
+    );
+
+    let mut updates: Vec<(&str, Value)> = Vec::new();
+    if current_port != ACC_DEFAULT_PORT {
+        updates.push(("updListenerPort", Value::from(ACC_DEFAULT_PORT)));
+    }
+    let proposed_password = if current_password.is_empty() {
+        updates.push((
+            "connectionPassword",
+            Value::from(assetto_corsa_competizione::DEFAULT_PASSWORD),
+        ));
+        assetto_corsa_competizione::DEFAULT_PASSWORD.to_owned()
+    } else {
+        current_password.clone()
+    };
+
+    if updates.is_empty() {
+        println!(
+            "  {} broadcasting already enabled — no changes needed.",
+            style::ok()
+        );
+        report_acc_probe(ACC_DEFAULT_PORT as u16, &proposed_password);
+        return Ok(());
+    }
+
+    let proposed_summary: Vec<String> = updates
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+    println!("  proposed: {}", proposed_summary.join(", "));
+    println!(
+        "  {} close ACC before applying — a running game may overwrite the change.",
+        style::warn()
+    );
+    if !confirm("  Apply?")? {
+        println!("  skipped.");
+        report_acc_probe(ACC_DEFAULT_PORT as u16, &proposed_password);
+        return Ok(());
+    }
+
+    for (k, v) in updates {
+        doc[k] = v;
+    }
+    let new_raw = json_to_acc_format(&doc)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let new_bytes = encode_utf16_le(&new_raw);
+    write_with_backup(&config_path, &new_bytes)?;
+    println!(
+        "  {} written. Use --password \"{proposed_password}\" with the broadcasting client \
+         (e.g. `cargo run --example assetto_corsa_competizione_log -- --password \"{proposed_password}\"`).",
+        style::ok()
+    );
+    println!(
+        "  {} restart ACC, then re-run `moza-rev configure` to verify the broadcasting port \
+         is actually open.",
+        style::warn()
+    );
+    println!();
+    Ok(())
+}
+
+/// Live probe: send a real REGISTER packet to ACC's broadcasting port
+/// and report what comes back. Distinguishes "ACC not listening" from
+/// "ACC listening but rejecting our password" from "wedged" — useful
+/// because ACC's broadcasting status has no in-game UI.
+fn report_acc_probe(port: u16, password: &str) {
+    println!("  probing 127.0.0.1:{port}…");
+    match probe_acc_broadcasting(port, password) {
+        AccProbeResult::Listening {
+            connection_id,
+            readonly,
+        } => {
+            println!(
+                "  {} ACC responded: connection_id={connection_id}, readonly={readonly}. \
+                 Broadcasting is live.",
+                style::ok()
+            );
+        }
+        AccProbeResult::Rejected { error } => {
+            let hint = if error.to_lowercase().contains("outdated") {
+                "Bump `assetto_corsa_competizione::PROTOCOL_VERSION` to match the version ACC expects."
+            } else if error.to_lowercase().contains("password") {
+                "The connectionPassword on disk doesn't match what's in ACC's memory — \
+                 close ACC, re-run this command, then restart ACC."
+            } else {
+                "See the message above — moza-rev's REGISTER reached ACC but ACC refused it."
+            };
+            println!(
+                "  {} ACC rejected our REGISTER: {error:?}.\n  {hint}",
+                style::cross()
+            );
+        }
+        AccProbeResult::Refused => {
+            println!(
+                "  {} nothing is listening on UDP/{port} — ACC isn't running, or it was \
+                 launched before broadcasting.json was written. Start (or restart) ACC and \
+                 re-run this command.",
+                style::warn()
+            );
+        }
+        AccProbeResult::Timeout => {
+            println!(
+                "  {} no reply within the probe window — ACC may be loading. \
+                 Try again once it's at the main menu.",
+                style::warn()
+            );
+        }
+        AccProbeResult::ProbeError(reason) => {
+            println!("  {} couldn't probe: {reason}", style::warn());
+        }
+    }
+    println!();
+}
+
+enum AccProbeResult {
+    Listening { connection_id: i32, readonly: bool },
+    Rejected { error: String },
+    Refused,
+    Timeout,
+    ProbeError(String),
+}
+
+fn probe_acc_broadcasting(port: u16, password: &str) -> AccProbeResult {
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+    let target = format!("127.0.0.1:{port}");
+
+    let socket = match UdpSocket::bind("0.0.0.0:0") {
+        Ok(s) => s,
+        Err(e) => return AccProbeResult::ProbeError(format!("bind ephemeral: {e}")),
+    };
+    if let Err(e) = socket.connect(&target) {
+        return AccProbeResult::ProbeError(format!("connect {target}: {e}"));
+    }
+    if let Err(e) = socket.set_read_timeout(Some(PROBE_TIMEOUT)) {
+        return AccProbeResult::ProbeError(format!("set_read_timeout: {e}"));
+    }
+
+    let pkt = assetto_corsa_competizione::build_register("moza-rev-verify", password, 1000, "");
+    if let Err(e) = socket.send(&pkt) {
+        if e.kind() == ErrorKind::ConnectionRefused {
+            return AccProbeResult::Refused;
+        }
+        return AccProbeResult::ProbeError(format!("send register: {e}"));
+    }
+
+    let mut buf = [0u8; 4096];
+    match socket.recv(&mut buf) {
+        Ok(n) => match assetto_corsa_competizione::parse_message(&buf[..n]) {
+            Some(assetto_corsa_competizione::Message::RegistrationResult(r)) if r.success => {
+                // Best-effort cleanup so ACC doesn't keep us in its broadcaster list.
+                let _ = socket.send(&assetto_corsa_competizione::build_unregister(r.connection_id));
+                AccProbeResult::Listening {
+                    connection_id: r.connection_id,
+                    readonly: r.readonly,
+                }
+            }
+            Some(assetto_corsa_competizione::Message::RegistrationResult(r)) => {
+                AccProbeResult::Rejected {
+                    error: if r.error_message.is_empty() {
+                        "(no error message)".to_string()
+                    } else {
+                        r.error_message
+                    },
+                }
+            }
+            _ => AccProbeResult::ProbeError(format!("unexpected reply ({n} bytes)")),
+        },
+        Err(e) if e.kind() == ErrorKind::ConnectionRefused => AccProbeResult::Refused,
+        Err(e)
+            if matches!(
+                e.kind(),
+                ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+            ) =>
+        {
+            AccProbeResult::Timeout
+        }
+        Err(e) => AccProbeResult::ProbeError(format!("recv: {e}")),
+    }
+}
+
+/// Serialize JSON in the exact shape ACC emits: 4-space indent, no
+/// trailing newline, key order preserved from the loaded document.
+/// stock `serde_json::to_string_pretty` uses 2-space indent and (with
+/// default features) alphabetises keys — both differences make ACC's
+/// loader decide our file "needs rewriting" and clobber it on launch.
+fn json_to_acc_format(doc: &Value) -> serde_json::Result<String> {
+    let formatter = PrettyFormatter::with_indent(b"    ");
+    let mut buf = Vec::new();
+    let mut ser = Serializer::with_formatter(&mut buf, formatter);
+    doc.serialize(&mut ser)?;
+    // PrettyFormatter only emits ASCII whitespace + JSON tokens, all valid UTF-8.
+    Ok(String::from_utf8(buf).expect("PrettyFormatter emits valid UTF-8"))
+}
+
+/// Decode a UTF-16 LE byte stream (no BOM) to a Rust `String`. ACC's
+/// broadcasting.json is the only file we touch in this format.
+fn decode_utf16_le(bytes: &[u8]) -> Result<String, String> {
+    if bytes.len() % 2 != 0 {
+        return Err(format!(
+            "odd-length UTF-16 byte stream ({} bytes)",
+            bytes.len()
+        ));
+    }
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    String::from_utf16(&units).map_err(|e| e.to_string())
+}
+
+fn encode_utf16_le(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len() * 2);
+    for u in s.encode_utf16() {
+        out.extend_from_slice(&u.to_le_bytes());
+    }
+    out
+}
+
+//
 // I/O helpers
 //
 
-fn write_with_backup(path: &Path, content: &str) -> io::Result<()> {
+fn write_with_backup(path: &Path, content: impl AsRef<[u8]>) -> io::Result<()> {
     if path.exists() {
         let backup = path.with_extension(match path.extension().and_then(|s| s.to_str()) {
             Some(ext) => format!("{ext}.bak"),
@@ -773,5 +1043,128 @@ mod tests {
         let xml = r#"<x><motion enabled="false" /><udp enabled="true" /></x>"#;
         let range = find_motion_or_udp_element(xml).unwrap();
         assert!(xml[range].starts_with("<udp "));
+    }
+
+    #[test]
+    fn utf16_le_roundtrips_ascii() {
+        let s = r#"{"updListenerPort": 9000}"#;
+        let encoded = encode_utf16_le(s);
+        // ASCII: every other byte is 0.
+        assert_eq!(encoded.len(), s.len() * 2);
+        assert_eq!(encoded[0], b'{');
+        assert_eq!(encoded[1], 0);
+        assert_eq!(decode_utf16_le(&encoded).unwrap(), s);
+    }
+
+    #[test]
+    fn utf16_le_decodes_acc_broadcasting_json_sample() {
+        // Reproduces the exact bytes from a fresh ACC broadcasting.json
+        // (UTF-16 LE, no BOM, 4-space indent, no trailing newline).
+        // ACC's literal key spelling is `updListenerPort` — `upd` not
+        // `udp`, a Kunos typo. Bytes here encode that exact spelling.
+        let bytes: &[u8] = &[
+            0x7b, 0x00, 0x0a, 0x00, 0x20, 0x00, 0x20, 0x00, 0x20, 0x00, 0x20, 0x00, 0x22, 0x00,
+            0x75, 0x00, 0x70, 0x00, 0x64, 0x00, 0x4c, 0x00, 0x69, 0x00, 0x73, 0x00, 0x74, 0x00,
+            0x65, 0x00, 0x6e, 0x00, 0x65, 0x00, 0x72, 0x00, 0x50, 0x00, 0x6f, 0x00, 0x72, 0x00,
+            0x74, 0x00, 0x22, 0x00, 0x3a, 0x00, 0x20, 0x00, 0x30, 0x00, 0x7d, 0x00,
+        ];
+        let s = decode_utf16_le(bytes).unwrap();
+        assert_eq!(s, "{\n    \"updListenerPort\": 0}");
+        // serde_json must accept the decoded form even with the leading newline.
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["updListenerPort"], 0);
+    }
+
+    #[test]
+    fn utf16_le_encode_then_parse_succeeds() {
+        let v = serde_json::json!({
+            "updListenerPort": 9000,
+            "connectionPassword": "moza",
+            "commandPassword": "",
+        });
+        let pretty = serde_json::to_string_pretty(&v).unwrap();
+        let bytes = encode_utf16_le(&pretty);
+        let decoded = decode_utf16_le(&bytes).unwrap();
+        let reparsed: serde_json::Value = serde_json::from_str(&decoded).unwrap();
+        assert_eq!(reparsed["updListenerPort"], 9000);
+        assert_eq!(reparsed["connectionPassword"], "moza");
+    }
+
+    #[test]
+    fn utf16_le_rejects_odd_length() {
+        assert!(decode_utf16_le(&[0x7b, 0x00, 0x0a]).is_err());
+    }
+
+    #[test]
+    fn json_to_acc_format_matches_acc_layout() {
+        // Mirror the exact key order ACC uses on disk. With the
+        // `preserve_order` feature, parsing then re-emitting keeps the
+        // order stable.
+        let raw = "{\n    \"updListenerPort\": 0,\n    \"connectionPassword\": \"\",\n    \"commandPassword\": \"\"\n}";
+        let mut doc: Value = serde_json::from_str(raw).unwrap();
+        doc["updListenerPort"] = Value::from(9000);
+        doc["connectionPassword"] = Value::from("moza");
+        let out = json_to_acc_format(&doc).unwrap();
+        let expected = "{\n    \"updListenerPort\": 9000,\n    \"connectionPassword\": \"moza\",\n    \"commandPassword\": \"\"\n}";
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn end_to_end_acc_file_path_does_not_duplicate_keys() {
+        // Exact bytes from the user's broadcasting.json before our fix:
+        // 178 bytes UTF-16 LE, no BOM, port=0 password="moza" cmd="".
+        let input: &[u8] = &[
+            0x7b, 0x00, 0x0a, 0x00, 0x20, 0x00, 0x20, 0x00, 0x20, 0x00, 0x20, 0x00, 0x22, 0x00,
+            0x75, 0x00, 0x70, 0x00, 0x64, 0x00, 0x4c, 0x00, 0x69, 0x00, 0x73, 0x00, 0x74, 0x00,
+            0x65, 0x00, 0x6e, 0x00, 0x65, 0x00, 0x72, 0x00, 0x50, 0x00, 0x6f, 0x00, 0x72, 0x00,
+            0x74, 0x00, 0x22, 0x00, 0x3a, 0x00, 0x20, 0x00, 0x30, 0x00, 0x2c, 0x00, 0x0a, 0x00,
+            0x20, 0x00, 0x20, 0x00, 0x20, 0x00, 0x20, 0x00, 0x22, 0x00, 0x63, 0x00, 0x6f, 0x00,
+            0x6e, 0x00, 0x6e, 0x00, 0x65, 0x00, 0x63, 0x00, 0x74, 0x00, 0x69, 0x00, 0x6f, 0x00,
+            0x6e, 0x00, 0x50, 0x00, 0x61, 0x00, 0x73, 0x00, 0x73, 0x00, 0x77, 0x00, 0x6f, 0x00,
+            0x72, 0x00, 0x64, 0x00, 0x22, 0x00, 0x3a, 0x00, 0x20, 0x00, 0x22, 0x00, 0x6d, 0x00,
+            0x6f, 0x00, 0x7a, 0x00, 0x61, 0x00, 0x22, 0x00, 0x2c, 0x00, 0x0a, 0x00, 0x20, 0x00,
+            0x20, 0x00, 0x20, 0x00, 0x20, 0x00, 0x22, 0x00, 0x63, 0x00, 0x6f, 0x00, 0x6d, 0x00,
+            0x6d, 0x00, 0x61, 0x00, 0x6e, 0x00, 0x64, 0x00, 0x50, 0x00, 0x61, 0x00, 0x73, 0x00,
+            0x73, 0x00, 0x77, 0x00, 0x6f, 0x00, 0x72, 0x00, 0x64, 0x00, 0x22, 0x00, 0x3a, 0x00,
+            0x20, 0x00, 0x22, 0x00, 0x22, 0x00, 0x0a, 0x00, 0x7d, 0x00,
+        ];
+        let raw = decode_utf16_le(input).unwrap();
+        let mut doc: Value = serde_json::from_str(&raw).unwrap();
+        doc["updListenerPort"] = Value::from(9000_i64);
+        let out = json_to_acc_format(&doc).unwrap();
+        // Must contain exactly one ListenerPort entry — searching for any
+        // case of `ListenerPort` catches both correct and any wrongly-cased
+        // sibling key, so we'd notice a duplicate either way.
+        let count = out.matches("ListenerPort").count();
+        assert_eq!(count, 1, "got duplicates / wrong key:\n{out}");
+        assert!(out.contains("\"updListenerPort\": 9000"));
+    }
+
+    #[test]
+    fn json_to_acc_format_roundtrips_to_utf16_le_bytes_acc_emits() {
+        // Build the value in the order ACC writes, encode via our pipeline,
+        // and verify the resulting UTF-16 LE bytes match a stock ACC file
+        // (port=0, empty passwords) byte-for-byte.
+        let raw = "{\n    \"updListenerPort\": 0,\n    \"connectionPassword\": \"\",\n    \"commandPassword\": \"\"\n}";
+        let doc: Value = serde_json::from_str(raw).unwrap();
+        let out = json_to_acc_format(&doc).unwrap();
+        let bytes = encode_utf16_le(&out);
+        // Mirror the xxd of an unmodified broadcasting.json (178 bytes).
+        let expected: &[u8] = &[
+            0x7b, 0x00, 0x0a, 0x00, 0x20, 0x00, 0x20, 0x00, 0x20, 0x00, 0x20, 0x00, 0x22, 0x00,
+            0x75, 0x00, 0x70, 0x00, 0x64, 0x00, 0x4c, 0x00, 0x69, 0x00, 0x73, 0x00, 0x74, 0x00,
+            0x65, 0x00, 0x6e, 0x00, 0x65, 0x00, 0x72, 0x00, 0x50, 0x00, 0x6f, 0x00, 0x72, 0x00,
+            0x74, 0x00, 0x22, 0x00, 0x3a, 0x00, 0x20, 0x00, 0x30, 0x00, 0x2c, 0x00, 0x0a, 0x00,
+            0x20, 0x00, 0x20, 0x00, 0x20, 0x00, 0x20, 0x00, 0x22, 0x00, 0x63, 0x00, 0x6f, 0x00,
+            0x6e, 0x00, 0x6e, 0x00, 0x65, 0x00, 0x63, 0x00, 0x74, 0x00, 0x69, 0x00, 0x6f, 0x00,
+            0x6e, 0x00, 0x50, 0x00, 0x61, 0x00, 0x73, 0x00, 0x73, 0x00, 0x77, 0x00, 0x6f, 0x00,
+            0x72, 0x00, 0x64, 0x00, 0x22, 0x00, 0x3a, 0x00, 0x20, 0x00, 0x22, 0x00, 0x22, 0x00,
+            0x2c, 0x00, 0x0a, 0x00, 0x20, 0x00, 0x20, 0x00, 0x20, 0x00, 0x20, 0x00, 0x22, 0x00,
+            0x63, 0x00, 0x6f, 0x00, 0x6d, 0x00, 0x6d, 0x00, 0x61, 0x00, 0x6e, 0x00, 0x64, 0x00,
+            0x50, 0x00, 0x61, 0x00, 0x73, 0x00, 0x73, 0x00, 0x77, 0x00, 0x6f, 0x00, 0x72, 0x00,
+            0x64, 0x00, 0x22, 0x00, 0x3a, 0x00, 0x20, 0x00, 0x22, 0x00, 0x22, 0x00, 0x0a, 0x00,
+            0x7d, 0x00,
+        ];
+        assert_eq!(bytes, expected, "byte-level output drift from ACC's format");
     }
 }

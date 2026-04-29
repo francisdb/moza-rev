@@ -34,7 +34,8 @@ A single `cargo run` opens all per-game telemetry sources simultaneously and rou
 | Live For Speed (and other OutGauge clients) | 4444 | manual | Same listener |
 | Automobilista 2 / Project CARS 2 | 5606 | manual ² | Requires Linux loopback fix ²ʹ |
 | Assetto Corsa 1 | 9996 | always on ³ | Handshake-based; adaptive redline |
-| Assetto Corsa Competizione, Assetto Corsa Rally | — | flagged | Detected but not yet parsed (ACC has a UDP API; ACR hasn't shipped one) |
+| Assetto Corsa Competizione | 9000 | ✓ auto | Broadcasting API ⁴ — gear/speed/lap only, **no RPM** |
+| Assetto Corsa Rally | — | flagged | UE5; Kunos hasn't shipped a documented telemetry export yet |
 | Wreckfest 1, DIRT 5 | — | flagged | No native UDP — would need [SpaceMonkey](https://github.com/PHARTGAMES/SpaceMonkey) under Wine |
 
 ¹ DiRT 2 / 3, F1 2010-2017, GRID / GRID 2 / GRID Autosport, DiRT Rally 1.0 all share the same UDP format on port 20777 and should work, but haven't been individually verified.
@@ -44,6 +45,8 @@ A single `cargo run` opens all per-game telemetry sources simultaneously and rou
 ²ʹ See the **AMS2 / PC2** subsection below for the iptables one-liner needed on Linux.
 
 ³ AC's UDP listener is unconditionally on once a session is loaded — no telemetry toggles. `configure` instead offers to write `steam_appid.txt` next to `acs.exe` to fix the standard Proton launcher workaround (see the **Assetto Corsa** subsection).
+
+⁴ ACC's broadcasting API is connection-oriented (register/result handshake, password). It carries gear, speed, lap, position, weather — but not engine RPM, so it can't drive the LED bar on its own. `configure` enables broadcasting in `broadcasting.json` and the `assetto_corsa_competizione_log` example exercises the protocol; an RPM-capable ACC bridge would still need a Windows-side shared-memory reader.
 
 ## Setup details
 
@@ -85,6 +88,19 @@ Caveat — same as BeamNG: AC's `RTCarInfo` doesn't carry a redline, so moza-rev
 
 Linux launcher caveat: AC's stock launcher (`AssettoCorsa.exe`, .NET WPF + CEF3) often fails on current Wine/Proton with an assembly-load error. The standard workaround is to add `acs.exe` (the actual game binary, in the install root) as a non-Steam shortcut and force a stable Proton on it. That direct launch then needs a `steam_appid.txt` containing `244210` next to `acs.exe`, or `acs.exe` exits ~2 s after start with no error message. `moza-rev configure` offers to write that file.
 
+### Assetto Corsa Competizione
+
+ACC's only network-telemetry surface is the **Broadcasting API** — connection-oriented UDP on port 9000 with a password handshake. It's intended for spectator overlays, so it carries gear, speed, lap, position, weather, but **not** engine RPM. moza-rev includes a parser and example, but driving the LED bar from ACC would still need a Windows-side shared-memory bridge for RPM.
+
+`moza-rev configure` handles enablement: it edits `Documents/Assetto Corsa Competizione/Config/broadcasting.json` (UTF-16 LE) to set `updListenerPort: 9000` and `connectionPassword: "moza"` — yes, that key really is `upd`-not-`udp`, a Kunos typo we have to match exactly or ACC ignores the value. Confirmation + `.bak` as usual. **Close ACC before applying** — a running game rewrites the file on exit.
+
+The example connects, registers, and logs session and focused-car updates. With the default `configure`-written password it needs no flags:
+
+```sh
+cargo run --example assetto_corsa_competizione_log
+# pass --password <pwd> if you set a different connectionPassword
+```
+
 ## Prerequisites
 
 - Rust (stable, 2024 edition).
@@ -123,6 +139,8 @@ cargo run --example dirt_rally_2_log     # one-line summary per Codemasters EGO 
 cargo run --example beamng_log           # one-line summary per OutGauge packet
 cargo run --example automobilista_2_log  # one-line summary per AMS2 / PC2 telemetry packet
 cargo run --example assetto_corsa_log    # handshake + one-line summary per RTCarInfo packet
+cargo run --example assetto_corsa_competizione_log
+                                         # ACC Broadcasting API session + focused-car updates
 ```
 
 ## Logging

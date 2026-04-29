@@ -19,8 +19,11 @@
 //   cargo run --example assetto_corsa_log -- --raw    # log every packet (no throttle)
 
 use std::env;
+use std::io::ErrorKind;
 use std::net::{SocketAddr, UdpSocket};
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use log::{error, info, warn};
@@ -31,6 +34,9 @@ use moza_rev::assetto_corsa::{
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Stream-loop recv timeout — short enough that Ctrl-C is noticed
+/// quickly, long enough not to spin the CPU when AC has paused the stream.
+const STREAM_POLL: Duration = Duration::from_millis(200);
 /// AC's UPDATE subscription fires ~333 Hz; that's unreadable in a
 /// terminal. Default to a friendly ~10 Hz log rate; `--raw` disables.
 const LOG_INTERVAL: Duration = Duration::from_millis(100);
@@ -150,18 +156,34 @@ fn main() -> ExitCode {
         }
     );
 
-    // No timeout for the streaming phase — rely on user Ctrl-C.
-    if let Err(e) = socket.set_read_timeout(None) {
-        warn!("clear read timeout: {e}");
+    // Short timeout so the loop wakes regularly enough to notice Ctrl-C.
+    if let Err(e) = socket.set_read_timeout(Some(STREAM_POLL)) {
+        warn!("set stream read timeout: {e}");
+    }
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    {
+        let s = shutdown.clone();
+        if let Err(e) = ctrlc::set_handler(move || s.store(true, Ordering::SeqCst)) {
+            warn!("install signal handler: {e} (Ctrl-C won't DISMISS cleanly)");
+        }
     }
 
     let mut last_log = Instant::now()
         .checked_sub(LOG_INTERVAL)
         .unwrap_or_else(Instant::now);
     let mut packets_since_log: u32 = 0;
-    loop {
+    while !shutdown.load(Ordering::SeqCst) {
         let n = match socket.recv(&mut buf) {
             Ok(n) => n,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                ) =>
+            {
+                continue;
+            }
             Err(e) => {
                 error!("recv: {e}");
                 continue;
@@ -175,6 +197,12 @@ fn main() -> ExitCode {
         last_log = Instant::now();
         packets_since_log = 0;
     }
+
+    info!("shutting down: sending Dismiss");
+    if let Err(e) = socket.send(&Handshake::new(op::DISMISS).to_bytes()) {
+        warn!("send dismiss: {e}");
+    }
+    ExitCode::SUCCESS
 }
 
 fn log_packet(buf: &[u8], packets_in_window: u32, raw: bool) {
