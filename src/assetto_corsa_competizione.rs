@@ -141,7 +141,10 @@ impl RealtimeUpdate {
     /// hh:mm extracted from `time_of_day_seconds` (wraps at 24h).
     pub fn time_of_day(&self) -> (u8, u8) {
         let total_secs = self.time_of_day_seconds.max(0.0) as u32;
-        (((total_secs / 3600) % 24) as u8, ((total_secs / 60) % 60) as u8)
+        (
+            ((total_secs / 3600) % 24) as u8,
+            ((total_secs / 60) % 60) as u8,
+        )
     }
 }
 
@@ -218,9 +221,13 @@ pub fn parse_message(buf: &[u8]) -> Option<Message> {
     let mut r = Reader::new(buf);
     let msg_type = r.read_u8()?;
     match msg_type {
-        inbound::REGISTRATION_RESULT => Some(Message::RegistrationResult(parse_registration(&mut r)?)),
+        inbound::REGISTRATION_RESULT => {
+            Some(Message::RegistrationResult(parse_registration(&mut r)?))
+        }
         inbound::REALTIME_UPDATE => Some(Message::RealtimeUpdate(parse_realtime_update(&mut r)?)),
-        inbound::REALTIME_CAR_UPDATE => Some(Message::RealtimeCarUpdate(parse_realtime_car_update(&mut r)?)),
+        inbound::REALTIME_CAR_UPDATE => Some(Message::RealtimeCarUpdate(
+            parse_realtime_car_update(&mut r)?,
+        )),
         other => Some(Message::Other {
             msg_type: other,
             body_len: buf.len().saturating_sub(1),

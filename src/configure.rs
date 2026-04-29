@@ -738,8 +738,9 @@ fn handle_acc_competizione() -> io::Result<()> {
     }
 
     let bytes = fs::read(&config_path)?;
-    let raw = decode_utf16_le(&bytes)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("UTF-16 LE decode: {e}")))?;
+    let raw = decode_utf16_le(&bytes).map_err(|e| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("UTF-16 LE decode: {e}"))
+    })?;
     let mut doc: Value = serde_json::from_str(&raw)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
@@ -786,10 +787,7 @@ fn handle_acc_competizione() -> io::Result<()> {
         return Ok(());
     }
 
-    let proposed_summary: Vec<String> = updates
-        .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect();
+    let proposed_summary: Vec<String> = updates.iter().map(|(k, v)| format!("{k}={v}")).collect();
     println!("  proposed: {}", proposed_summary.join(", "));
     println!(
         "  {} close ACC before applying — a running game may overwrite the change.",
@@ -911,7 +909,9 @@ fn probe_acc_broadcasting(port: u16, password: &str) -> AccProbeResult {
         Ok(n) => match assetto_corsa_competizione::parse_message(&buf[..n]) {
             Some(assetto_corsa_competizione::Message::RegistrationResult(r)) if r.success => {
                 // Best-effort cleanup so ACC doesn't keep us in its broadcaster list.
-                let _ = socket.send(&assetto_corsa_competizione::build_unregister(r.connection_id));
+                let _ = socket.send(&assetto_corsa_competizione::build_unregister(
+                    r.connection_id,
+                ));
                 AccProbeResult::Listening {
                     connection_id: r.connection_id,
                     readonly: r.readonly,
