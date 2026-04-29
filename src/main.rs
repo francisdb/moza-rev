@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use log::{debug, error, info, warn};
 
+use moza_rev::assetto_corsa::{self, Handshake, HandshakeResponse, RtCarInfo, op};
 use moza_rev::codemasters_legacy::{self, Telemetry};
 use moza_rev::configure;
 use moza_rev::madness;
@@ -19,6 +20,7 @@ const DEFAULT_WF2_PORT: u16 = 23123;
 const DEFAULT_DR2_PORT: u16 = codemasters_legacy::DEFAULT_PORT; // 20777
 const DEFAULT_BEAMNG_PORT: u16 = outgauge::DEFAULT_PORT; // 4444
 const DEFAULT_AMS2_PORT: u16 = madness::DEFAULT_PORT; // 5606
+const DEFAULT_AC_PORT: u16 = assetto_corsa::DEFAULT_PORT; // 9996
 const DEFAULT_LED_COUNT: usize = 10;
 /// AMS2 / PC2 don't transmit an idle RPM. Use a typical petrol-car value;
 /// the bar will start lighting slightly above this. Tweak via the constant
@@ -33,6 +35,26 @@ const BEAMNG_INITIAL_REDLINE: f32 = 7000.0;
 /// And no idle either. Most petrol engines idle at ~700-900 RPM; below
 /// this we treat as engine off and skip frames.
 const BEAMNG_ASSUMED_IDLE: i32 = 800;
+
+/// Assetto Corsa's RTCarInfo packet has no redline / max-RPM field, so
+/// we adapt like BeamNG does. Start at a typical petrol value.
+const AC_INITIAL_REDLINE: f32 = 7000.0;
+const AC_ASSUMED_IDLE: i32 = 800;
+/// How often to retry the handshake when AC isn't responding (no
+/// session loaded, or AC not running). Keep low enough that startup
+/// order doesn't matter, high enough not to hammer the network.
+const AC_HANDSHAKE_RETRY: Duration = Duration::from_secs(3);
+/// Time to wait for AC's handshake reply before giving up and retrying.
+const AC_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(800);
+/// Time to wait for the next RTCarInfo packet before treating the
+/// session as ended and going back to handshake retry.
+const AC_STREAM_TIMEOUT: Duration = Duration::from_secs(2);
+/// AC's UPDATE subscription fires every physics step (~333 Hz), 3-5x
+/// faster than any other game's telemetry cadence. The wheel only
+/// needs LED updates at the heartbeat rate (~4 Hz nominal, more on
+/// state change), so we cap the forward rate to a sane ~60 Hz to
+/// avoid flooding the channel without dropping LED responsiveness.
+const AC_FORWARD_INTERVAL: Duration = Duration::from_millis(16);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
 const STATUS_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -67,6 +89,8 @@ enum GameId {
     /// Automobilista 2 / Project CARS 2 (and PC1, PC3) — Madness-engine
     /// PC2 UDP format.
     Ams2,
+    /// Assetto Corsa 1 — handshake-based UDP, adaptive redline.
+    AssettoCorsa,
 }
 
 impl GameId {
@@ -76,6 +100,7 @@ impl GameId {
             GameId::CodemastersLegacy => "DR2",
             GameId::BeamNG => "BNG",
             GameId::Ams2 => "AMS2",
+            GameId::AssettoCorsa => "AC",
         }
     }
 }
@@ -135,9 +160,10 @@ fn main() -> ExitCode {
     if !spawn_listener(args.ams2_port, GameId::Ams2, tx.clone()) {
         return ExitCode::FAILURE;
     }
-    if !spawn_beamng_listener(args.beamng_port, tx) {
+    if !spawn_beamng_listener(args.beamng_port, tx.clone()) {
         return ExitCode::FAILURE;
     }
+    spawn_ac_listener(args.ac_port, tx);
 
     // Only do the in-place `\r` rewrite when stdout is a real TTY. Piped
     // output (`moza-rev | tee log.txt`, systemd, journald, etc.) gets
@@ -296,9 +322,10 @@ fn parse(game: GameId, buf: &[u8]) -> Option<EngineState> {
                 rpm_idle: AMS2_ASSUMED_IDLE,
             })
         }
-        // BeamNG runs on a separate listener that maintains adaptive
-        // redline state — see `listener_loop_outgauge`.
-        GameId::BeamNG => None,
+        // BeamNG and Assetto Corsa run on dedicated listeners that
+        // maintain adaptive redline state — see `listener_loop_outgauge`
+        // and `listener_loop_ac`.
+        GameId::BeamNG | GameId::AssettoCorsa => None,
     }
 }
 
@@ -358,6 +385,135 @@ fn listener_loop_outgauge(socket: UdpSocket, tx: mpsc::Sender<Update>) {
             .is_err()
         {
             return;
+        }
+    }
+}
+
+/// Assetto Corsa is request-response: the client must send a Handshake
+/// to AC's listener port and receive a HandshakeResponse before AC
+/// streams anything. We retry the handshake periodically so it doesn't
+/// matter whether AC is started before or after moza-rev — whenever a
+/// session loads, this loop will pick it up. RTCarInfo has no redline
+/// field, so we adapt like BeamNG does.
+fn spawn_ac_listener(port: u16, tx: mpsc::Sender<Update>) {
+    let target = format!("127.0.0.1:{port}");
+    info!("listening for AC telemetry via udp://{target} (handshake retry every {}s)",
+          AC_HANDSHAKE_RETRY.as_secs());
+    thread::Builder::new()
+        .name("listener-AC".to_string())
+        .spawn(move || listener_loop_ac(target, tx))
+        .expect("failed to spawn AC listener thread");
+}
+
+fn listener_loop_ac(target: String, tx: mpsc::Sender<Update>) {
+    let mut buf = vec![0u8; 1024];
+    let mut max_rpm: f32 = AC_INITIAL_REDLINE;
+
+    loop {
+        // Fresh socket per cycle so AC sees a new client. The previous
+        // session's ephemeral port may already have a queued Dismiss.
+        let socket = match UdpSocket::bind("0.0.0.0:0") {
+            Ok(s) => s,
+            Err(e) => {
+                error!("AC bind: {e}");
+                thread::sleep(AC_HANDSHAKE_RETRY);
+                continue;
+            }
+        };
+        if let Err(e) = socket.connect(&target) {
+            debug!("AC connect {target}: {e}");
+            thread::sleep(AC_HANDSHAKE_RETRY);
+            continue;
+        }
+        if let Err(e) = socket.set_read_timeout(Some(AC_HANDSHAKE_TIMEOUT)) {
+            error!("AC set_read_timeout: {e}");
+            thread::sleep(AC_HANDSHAKE_RETRY);
+            continue;
+        }
+
+        if let Err(e) = socket.send(&Handshake::new(op::HANDSHAKE).to_bytes()) {
+            debug!("AC send handshake: {e}");
+            thread::sleep(AC_HANDSHAKE_RETRY);
+            continue;
+        }
+        let n = match socket.recv(&mut buf) {
+            Ok(n) => n,
+            Err(_) => {
+                // Most common case: AC not running, or running but no
+                // session loaded. Quiet at debug level — info-level
+                // chatter every 3s would be noisy.
+                debug!("AC handshake: no reply, retrying");
+                thread::sleep(AC_HANDSHAKE_RETRY);
+                continue;
+            }
+        };
+        let Some(hs) = HandshakeResponse::from_bytes(&buf[..n]) else {
+            warn!("AC handshake reply too short ({n} bytes); retrying");
+            thread::sleep(AC_HANDSHAKE_RETRY);
+            continue;
+        };
+        info!(
+            "AC connected: car={:?} track={:?} driver={:?}",
+            hs.car(),
+            hs.track(),
+            hs.driver()
+        );
+
+        if let Err(e) = socket.send(&Handshake::new(op::SUBSCRIBE_UPDATE).to_bytes()) {
+            warn!("AC subscribe: {e}");
+            continue;
+        }
+        if let Err(e) = socket.set_read_timeout(Some(AC_STREAM_TIMEOUT)) {
+            warn!("AC set stream timeout: {e}");
+            continue;
+        }
+
+        // Stream loop. On timeout we treat it as session ended and go
+        // back to handshake retry — covers menu return, quit, etc. We
+        // still receive every packet (so the stream-timeout watchdog
+        // works) but only forward at ~60 Hz to avoid spamming the
+        // channel at AC's full 333 Hz physics rate.
+        let mut last_forwarded = Instant::now()
+            .checked_sub(AC_FORWARD_INTERVAL)
+            .unwrap_or_else(Instant::now);
+        loop {
+            let n = match socket.recv(&mut buf) {
+                Ok(n) => n,
+                Err(_) => {
+                    info!("AC stream timed out; returning to handshake retry");
+                    let _ = socket.send(&Handshake::new(op::DISMISS).to_bytes());
+                    break;
+                }
+            };
+            let Some(p) = RtCarInfo::from_bytes(&buf[..n]) else {
+                continue;
+            };
+            let rpm_f = { p.engine_rpm };
+            // Skip menu / engine-off frames.
+            if rpm_f <= 1.0 {
+                continue;
+            }
+            if rpm_f > max_rpm {
+                max_rpm = rpm_f;
+            }
+            if last_forwarded.elapsed() < AC_FORWARD_INTERVAL {
+                continue;
+            }
+            last_forwarded = Instant::now();
+            let engine = EngineState {
+                rpm: rpm_f as i32,
+                rpm_redline: max_rpm as i32,
+                rpm_idle: AC_ASSUMED_IDLE,
+            };
+            if tx
+                .send(Update {
+                    game: GameId::AssettoCorsa,
+                    engine,
+                })
+                .is_err()
+            {
+                return;
+            }
         }
     }
 }
@@ -460,6 +616,7 @@ struct Args {
     dr2_port: u16,
     ams2_port: u16,
     beamng_port: u16,
+    ac_port: u16,
     serial_path: Option<String>,
     led_count: usize,
     protocol: Option<Protocol>,
@@ -472,6 +629,7 @@ impl Args {
         let mut dr2_port = DEFAULT_DR2_PORT;
         let mut ams2_port = DEFAULT_AMS2_PORT;
         let mut beamng_port = DEFAULT_BEAMNG_PORT;
+        let mut ac_port = DEFAULT_AC_PORT;
         let mut serial_path = None;
         let mut led_count = DEFAULT_LED_COUNT;
         let mut protocol = None;
@@ -495,6 +653,10 @@ impl Args {
                 "--beamng-port" => {
                     let v = it.next().ok_or("--beamng-port needs a value")?;
                     beamng_port = v.parse().map_err(|_| format!("invalid port: {v}"))?;
+                }
+                "--ac-port" => {
+                    let v = it.next().ok_or("--ac-port needs a value")?;
+                    ac_port = v.parse().map_err(|_| format!("invalid port: {v}"))?;
                 }
                 "--serial" | "-s" => {
                     serial_path = Some(it.next().ok_or("--serial needs a path")?);
@@ -530,6 +692,7 @@ impl Args {
             dr2_port,
             ams2_port,
             beamng_port,
+            ac_port,
             serial_path,
             led_count,
             protocol,
@@ -543,8 +706,8 @@ fn print_usage() {
         "moza-rev — drive the Moza wheel's RPM LED bar from game telemetry\n\
          \n\
          usage: moza-rev [--wf2-port PORT] [--dr2-port PORT] [--ams2-port PORT]\n\
-                          [--beamng-port PORT] [--serial /dev/ttyACMx] [--leds N]\n\
-                          [--protocol modern|legacy] [-v]\n\
+                          [--beamng-port PORT] [--ac-port PORT] [--serial /dev/ttyACMx]\n\
+                          [--leds N] [--protocol modern|legacy] [-v]\n\
                 moza-rev configure   # detect installed games and offer to enable telemetry\n\
          \n\
          defaults: --wf2-port {DEFAULT_WF2_PORT} (Wreckfest 2 \"Pino\")\n\
@@ -553,6 +716,7 @@ fn print_usage() {
                    --ams2-port {DEFAULT_AMS2_PORT} (AMS2 / Project CARS 2 / PC1 / PC3 — see README\n\
                                                   for the iptables loopback fix on Linux)\n\
                    --beamng-port {DEFAULT_BEAMNG_PORT} (BeamNG.drive OutGauge / LFS)\n\
+                   --ac-port {DEFAULT_AC_PORT} (Assetto Corsa 1 — handshake-based, adaptive redline)\n\
                    --leds {DEFAULT_LED_COUNT}, serial+protocol autodetected.\n\
          \n\
          Both listeners run simultaneously. The active game is whichever\n\

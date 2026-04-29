@@ -12,14 +12,49 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+/// ANSI styling for the configure output — bold/cyan game titles, green
+/// ✓, red ✘, yellow ⚠. Auto-disabled when stdout isn't a terminal or
+/// when `NO_COLOR` is set (https://no-color.org).
+mod style {
+    use std::io::IsTerminal;
+    use std::sync::OnceLock;
+
+    fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal()
+        })
+    }
+
+    pub fn title(s: &str) -> String {
+        if enabled() {
+            format!("\x1b[1;36m{s}\x1b[0m")
+        } else {
+            s.to_string()
+        }
+    }
+    pub fn ok() -> &'static str {
+        if enabled() { "\x1b[32m✓\x1b[0m" } else { "✓" }
+    }
+    pub fn cross() -> &'static str {
+        if enabled() { "\x1b[31m✘\x1b[0m" } else { "✘" }
+    }
+    pub fn warn() -> &'static str {
+        if enabled() { "\x1b[33m⚠\x1b[0m" } else { "⚠" }
+    }
+}
+
 /// Steam app ids for games we know how to handle (or recognize).
 const WF2_APP_ID: &str = "1203190";
 const DR2_APP_ID: &str = "690790";
 const DIRT_SHOWDOWN_APP_ID: &str = "201700";
 const BEAMNG_APP_ID: &str = "284160";
 const AMS2_APP_ID: &str = "1066890";
+const AC_APP_ID: &str = "244210";
+const AC_INSTALL_DIR: &str = "assettocorsa";
 
 const AMS2_DEFAULT_PORT: u16 = 5606;
+const AC_DEFAULT_PORT: u16 = 9996;
 
 /// Detect-only — these run on EGO/proprietary engines without native UDP
 /// telemetry; the only path is memory injection (SpaceMonkey on Windows).
@@ -37,13 +72,6 @@ struct ManualEntry {
 
 const MANUAL_TELEMETRY_GAMES: &[ManualEntry] = &[
     ManualEntry {
-        app_id: "244210",
-        name: "Assetto Corsa",
-        notes: "  Has UDP remote telemetry (handshake protocol on ports 9996/9997).\n  \
-                Enable in-game via Apps menu, or edit Documents/Assetto Corsa/cfg/.\n  \
-                moza-rev does not yet have an AC parser.",
-    },
-    ManualEntry {
         app_id: "805550",
         name: "Assetto Corsa Competizione",
         notes: "  Has UDP Broadcasting API (port 9000, password handshake — connection-oriented).\n  \
@@ -54,9 +82,9 @@ const MANUAL_TELEMETRY_GAMES: &[ManualEntry] = &[
     ManualEntry {
         app_id: "3917090",
         name: "Assetto Corsa Rally",
-        notes: "  Has UDP remote telemetry (same format as base Assetto Corsa).\n  \
-                Some fields are not yet populated in early access.\n  \
-                moza-rev does not yet have an AC-family parser.",
+        notes: "  Built on Unreal Engine 5; Kunos hasn't shipped a documented UDP\n  \
+                telemetry export yet (binary strings show no protocol surface).\n  \
+                Likely arrives in a future early-access patch.",
     },
 ];
 
@@ -73,6 +101,18 @@ fn steam_library_roots() -> Vec<PathBuf> {
     .into_iter()
     .filter(|p| p.exists())
     .collect()
+}
+
+/// Find a game's install directory under `steamapps/common/<subdir>`
+/// across both Flatpak and native Steam install locations.
+fn steam_install_path(install_subdir: &str) -> Option<PathBuf> {
+    for root in steam_library_roots() {
+        let p = root.join("steamapps/common").join(install_subdir);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
 }
 
 /// Find the Proton "Documents" path for a Steam app id, across both
@@ -102,7 +142,10 @@ fn game_installed(app_id: &str) -> bool {
 }
 
 pub fn run() -> ExitCode {
-    println!("moza-rev configure: scanning for installed racing games\n");
+    println!(
+        "{}\n",
+        style::title("moza-rev configure: scanning for installed racing games")
+    );
 
     let mut any_handled = false;
 
@@ -134,18 +177,27 @@ pub fn run() -> ExitCode {
             eprintln!("BeamNG.drive: error: {e}\n");
         }
     }
+    if game_installed(AC_APP_ID) {
+        any_handled = true;
+        if let Err(e) = handle_ac() {
+            eprintln!("Assetto Corsa: error: {e}\n");
+        }
+    }
     for entry in MANUAL_TELEMETRY_GAMES {
         if game_installed(entry.app_id) {
             any_handled = true;
-            println!("{}", entry.name);
+            println!("{}", style::title(entry.name));
             println!("{}\n", entry.notes);
         }
     }
     for (app_id, name) in NO_TELEMETRY_GAMES {
         if game_installed(app_id) {
             any_handled = true;
-            println!("{name}");
-            println!("  Detected, but the game has no native UDP telemetry.");
+            println!("{}", style::title(name));
+            println!(
+                "  {} detected, but the game has no native UDP telemetry.",
+                style::cross()
+            );
             println!(
                 "  The only path on Linux is memory injection via SpaceMonkey under \
                  Wine — fragile and out of scope for moza-rev.\n"
@@ -173,7 +225,7 @@ pub fn run() -> ExitCode {
 //
 
 fn handle_wf2() -> io::Result<()> {
-    println!("Wreckfest 2");
+    println!("{}", style::title("Wreckfest 2"));
     let Some(docs) = proton_documents(WF2_APP_ID) else {
         println!(
             "  Installed but never launched — start the game once so it generates its config, then re-run.\n"
@@ -217,7 +269,7 @@ fn handle_wf2() -> io::Result<()> {
     );
 
     if current_enabled == 1 {
-        println!("  ✓ telemetry already enabled — no changes needed.\n");
+        println!("  {} telemetry already enabled — no changes needed.\n", style::ok());
         return Ok(());
     }
 
@@ -234,7 +286,7 @@ fn handle_wf2() -> io::Result<()> {
     let new_raw = serde_json::to_string_pretty(&doc)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     write_with_backup(&config_path, &new_raw)?;
-    println!("  ✓ written.\n");
+    println!("  {} written.\n", style::ok());
     Ok(())
 }
 
@@ -262,7 +314,7 @@ fn find_wf2_config(docs: &Path) -> Option<PathBuf> {
 //
 
 fn handle_dr2_style(name: &str, app_id: &str, my_games_subdir: &str) -> io::Result<()> {
-    println!("{name}");
+    println!("{}", style::title(name));
     let Some(docs) = proton_documents(app_id) else {
         println!(
             "  Installed but never launched — start the game once so it generates its config, then re-run.\n"
@@ -315,7 +367,10 @@ fn handle_dr2_style(name: &str, app_id: &str, my_games_subdir: &str) -> io::Resu
     }
 
     if updates.is_empty() {
-        println!("  ✓ telemetry already enabled with extradata=3 — no changes needed.\n");
+        println!(
+            "  {} telemetry already enabled with extradata=3 — no changes needed.\n",
+            style::ok()
+        );
         return Ok(());
     }
 
@@ -331,7 +386,7 @@ fn handle_dr2_style(name: &str, app_id: &str, my_games_subdir: &str) -> io::Resu
     new_raw.push_str(&new_line);
     new_raw.push_str(&raw[element_range.end..]);
     write_with_backup(&config_path, &new_raw)?;
-    println!("  ✓ written.\n");
+    println!("  {} written.\n", style::ok());
     Ok(())
 }
 
@@ -385,7 +440,7 @@ fn rewrite_xml_attrs(element: &str, updates: &[(&str, &str)]) -> String {
 //
 
 fn handle_ams2() {
-    println!("Automobilista 2");
+    println!("{}", style::title("Automobilista 2"));
     println!("  Has UDP telemetry on port {AMS2_DEFAULT_PORT} using the Project CARS 2 format.");
     println!("  In game: Options → System → UDP Protocol Version: Project CARS 2,");
     println!("                              UDP Frequency: 1+");
@@ -394,12 +449,14 @@ fn handle_ams2() {
     match probe_broadcast_loopback(AMS2_DEFAULT_PORT) {
         ProbeResult::LoopbackWorks => {
             println!(
-                "  ✓ broadcast loopback works on port {AMS2_DEFAULT_PORT} — game traffic will reach moza-rev."
+                "  {} broadcast loopback works on port {AMS2_DEFAULT_PORT} — game traffic will reach moza-rev.",
+                style::ok()
             );
         }
         ProbeResult::NoLoopback => {
             println!(
-                "  ⚠ broadcast loopback NOT working on port {AMS2_DEFAULT_PORT} — game traffic won't reach moza-rev."
+                "  {} broadcast loopback NOT working on port {AMS2_DEFAULT_PORT} — game traffic won't reach moza-rev.",
+                style::cross()
             );
             println!(
                 "    Linux doesn't loop limited-broadcast (255.255.255.255) to local sockets."
@@ -411,7 +468,7 @@ fn handle_ams2() {
             println!("        -j DNAT --to-destination 127.0.0.1:{AMS2_DEFAULT_PORT}");
         }
         ProbeResult::CouldNotProbe(reason) => {
-            println!("  Couldn't check broadcast loopback: {reason}");
+            println!("  {} couldn't check broadcast loopback: {reason}", style::warn());
         }
     }
     println!();
@@ -500,7 +557,7 @@ fn beamng_cloud_settings() -> Option<PathBuf> {
 }
 
 fn handle_beamng() -> io::Result<()> {
-    println!("BeamNG.drive");
+    println!("{}", style::title("BeamNG.drive"));
     let Some(settings_path) = beamng_cloud_settings() else {
         println!(
             "  Installed but no settings/cloud/settings.json yet — start the game once, then re-run.\n"
@@ -533,7 +590,7 @@ fn handle_beamng() -> io::Result<()> {
     );
 
     if current_enabled {
-        println!("  ✓ OutGauge already enabled — no changes needed.");
+        println!("  {} OutGauge already enabled — no changes needed.", style::ok());
         println!();
         return Ok(());
     }
@@ -541,7 +598,10 @@ fn handle_beamng() -> io::Result<()> {
     println!(
         "  proposed: protocols_outgauge_enabled = true (address/port unchanged: {current_address}:{current_port})"
     );
-    println!("  ⚠ close BeamNG before applying — a running game may overwrite the change.");
+    println!(
+        "  {} close BeamNG before applying — a running game may overwrite the change.",
+        style::warn()
+    );
     if !confirm("  Apply?")? {
         println!("  skipped.\n");
         return Ok(());
@@ -551,8 +611,68 @@ fn handle_beamng() -> io::Result<()> {
     let new_raw = serde_json::to_string_pretty(&doc)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     write_with_backup(&settings_path, &new_raw)?;
-    println!("  ✓ written.");
+    println!("  {} written.", style::ok());
     println!();
+    Ok(())
+}
+
+//
+// Assetto Corsa — UDP needs no in-game config; install-side fix-up only
+//
+// AC's UDP telemetry listens on port 9996 unconditionally once a session
+// is loaded — no setting toggles it. The one install-side gotcha is
+// that AC's stock launcher (AssettoCorsa.exe, .NET WPF + CEF3) often
+// fails on current Wine/Proton. The standard workaround is to add
+// `acs.exe` as a non-Steam shortcut, which then needs `steam_appid.txt`
+// alongside the binary or acs.exe will exit ~2 seconds after start
+// because its SteamAPI_Init can't reconcile the shortcut's hash-derived
+// AppID with the real one.
+//
+
+fn handle_ac() -> io::Result<()> {
+    println!("{}", style::title("Assetto Corsa"));
+    println!(
+        "  UDP telemetry needs no in-game setup — port {AC_DEFAULT_PORT} is always listening"
+    );
+    println!("  once a session is loaded.");
+
+    let Some(install) = steam_install_path(AC_INSTALL_DIR) else {
+        println!("  Couldn't locate install directory.\n");
+        return Ok(());
+    };
+
+    let appid_file = install.join("steam_appid.txt");
+    if appid_file.exists() {
+        println!(
+            "  {} steam_appid.txt present at {} — direct acs.exe launches will work.\n",
+            style::ok(),
+            appid_file.display()
+        );
+        return Ok(());
+    }
+
+    println!(
+        "  AC's stock launcher (AssettoCorsa.exe) often fails on current Wine/Proton with"
+    );
+    println!(
+        "  a CEF3/.NET assembly load error. Workaround: add acs.exe as a non-Steam game"
+    );
+    println!(
+        "  forced to a stable Proton. That direct launch then needs a steam_appid.txt"
+    );
+    println!(
+        "  next to the binary, or acs.exe exits ~2s after start with no error message."
+    );
+    println!(
+        "  proposed: write \"{AC_APP_ID}\" to {}",
+        appid_file.display()
+    );
+    if !confirm("  Apply?")? {
+        println!("  skipped.\n");
+        return Ok(());
+    }
+    fs::write(&appid_file, format!("{AC_APP_ID}\n"))?;
+    println!("  {} written.\n", style::ok());
     Ok(())
 }
 

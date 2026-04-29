@@ -1,3 +1,4 @@
+pub mod assetto_corsa;
 pub mod codemasters_legacy;
 pub mod configure;
 pub mod madness;
