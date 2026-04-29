@@ -89,9 +89,12 @@ const MANUAL_TELEMETRY_GAMES: &[ManualEntry] = &[
     ManualEntry {
         app_id: "3917090",
         name: "Assetto Corsa Rally",
-        notes: "  Built on Unreal Engine 5; Kunos hasn't shipped a documented UDP\n  \
-                telemetry export yet (binary strings show no protocol surface).\n  \
-                Likely arrives in a future early-access patch.",
+        notes: "  Built on UE5; Kunos exposes telemetry via a Windows shared-memory\n  \
+                ring buffer (binary symbols `KunosPhysicalProperties`, \n  \
+                `bSharedMemoryBufferCyclic`), not UDP. Same shape as iRacing on\n  \
+                Linux — a Proton-side bridge would be needed to surface it as UDP.\n  \
+                Reference: https://luizzak.itch.io/racing-overlay/devlog/1321475/assetto-corsa-rally-telemetry-support\n  \
+                (uses an `ACRallyMemReader` companion).",
     },
     ManualEntry {
         app_id: "1551360",

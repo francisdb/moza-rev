@@ -35,7 +35,7 @@ A single `cargo run` opens all per-game telemetry sources simultaneously and rou
 | Automobilista 2 / Project CARS 2 | 5606 | manual ² | Requires Linux loopback fix ²ʹ |
 | Assetto Corsa 1 | 9996 | always on ³ | Handshake-based; adaptive redline |
 | Assetto Corsa Competizione | 9000 | ✓ auto | Broadcasting API ⁴ — gear/speed/lap only, **no RPM** |
-| Assetto Corsa Rally | — | flagged | UE5; Kunos hasn't shipped a documented telemetry export yet |
+| Assetto Corsa Rally | — | flagged | UE5; [shared-memory ring buffer only](https://luizzak.itch.io/racing-overlay/devlog/1321475/assetto-corsa-rally-telemetry-support), no UDP — same shape as iRacing on Linux |
 | Forza Horizon 5 / Horizon 4 / Motorsport 7 | 9999 ⁵ | manual | "Data Out" UDP (Sled / Dash); RPM + redline + idle in-protocol |
 | Wreckfest 1, DIRT 5 | — | flagged | No native UDP — would need [SpaceMonkey](https://github.com/PHARTGAMES/SpaceMonkey) under Wine |
 
