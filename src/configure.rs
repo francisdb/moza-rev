@@ -85,13 +85,32 @@ struct ManualEntry {
     notes: &'static str,
 }
 
-const MANUAL_TELEMETRY_GAMES: &[ManualEntry] = &[ManualEntry {
-    app_id: "3917090",
-    name: "Assetto Corsa Rally",
-    notes: "  Built on Unreal Engine 5; Kunos hasn't shipped a documented UDP\n  \
-            telemetry export yet (binary strings show no protocol surface).\n  \
-            Likely arrives in a future early-access patch.",
-}];
+const MANUAL_TELEMETRY_GAMES: &[ManualEntry] = &[
+    ManualEntry {
+        app_id: "3917090",
+        name: "Assetto Corsa Rally",
+        notes: "  Built on Unreal Engine 5; Kunos hasn't shipped a documented UDP\n  \
+                telemetry export yet (binary strings show no protocol surface).\n  \
+                Likely arrives in a future early-access patch.",
+    },
+    ManualEntry {
+        app_id: "1551360",
+        name: "Forza Horizon 5",
+        notes: "  In game: Settings → HUD and Gameplay → Data Out: On,\n  \
+                  Data Out IP Address: 127.0.0.1\n  \
+                  Data Out IP Port: 9999  (must match `--forza-port`)\n  \
+                Wire format is locked to Dash; no in-game format selector.\n  \
+                Settings live inside Proton's compatdata in a format we\n  \
+                haven't reverse-engineered, so this is in-game only.",
+    },
+    ManualEntry {
+        app_id: "1293830",
+        name: "Forza Horizon 4",
+        notes: "  Same Data Out setup as FH5 (Settings → HUD and Gameplay).\n  \
+                Same Dash UDP wire format; moza-rev's Forza listener\n  \
+                handles both transparently.",
+    },
+];
 
 /// Steam library paths to search for installed games.
 fn steam_library_roots() -> Vec<PathBuf> {

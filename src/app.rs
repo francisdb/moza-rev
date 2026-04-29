@@ -14,6 +14,7 @@ use log::{debug, error, info, warn};
 
 use moza_rev::assetto_corsa::{Handshake, HandshakeResponse, RtCarInfo, op};
 use moza_rev::codemasters_legacy::Telemetry;
+use moza_rev::forza;
 use moza_rev::madness;
 use moza_rev::moza::{self, BaseTemps, Moza, Protocol};
 use moza_rev::outgauge;
@@ -95,6 +96,9 @@ enum GameId {
     Ams2,
     /// Assetto Corsa 1 — handshake-based UDP, adaptive redline.
     AssettoCorsa,
+    /// Forza Data Out (FM7 / FH4 / FH5). RPM, redline and idle are all
+    /// in-protocol so no adaptive tracking is needed.
+    Forza,
 }
 
 impl GameId {
@@ -106,6 +110,7 @@ impl GameId {
             GameId::BeamNG => "BNG",
             GameId::Ams2 => "AMS2",
             GameId::AssettoCorsa => "AC",
+            GameId::Forza => "FZA",
         }
     }
 
@@ -117,6 +122,7 @@ impl GameId {
             GameId::BeamNG => "BeamNG.drive",
             GameId::Ams2 => "Automobilista 2 / Project CARS 2",
             GameId::AssettoCorsa => "Assetto Corsa",
+            GameId::Forza => "Forza (FM7 / FH4 / FH5)",
         }
     }
 }
@@ -188,6 +194,9 @@ pub fn run(args: ListenArgs) -> ExitCode {
         return ExitCode::FAILURE;
     }
     if !spawn_beamng_listener(args.beamng_port, tx.clone()) {
+        return ExitCode::FAILURE;
+    }
+    if !spawn_listener(args.forza_port, GameId::Forza, tx.clone()) {
         return ExitCode::FAILURE;
     }
     spawn_ac_listener(args.ac_port, tx);
@@ -375,6 +384,25 @@ fn parse(game: GameId, buf: &[u8]) -> Option<EngineState> {
                 rpm: pkt.data.rpm(),
                 rpm_redline: redline,
                 rpm_idle: AMS2_ASSUMED_IDLE,
+            })
+        }
+        GameId::Forza => {
+            let h = forza::Header::from_bytes(buf)?;
+            // Skip menu / paused frames where the engine isn't running.
+            if !h.is_race_on() {
+                return None;
+            }
+            let redline = h.redline_rpm();
+            let idle = h.idle_rpm();
+            // Same defensive guard as Codemasters / AMS2: if the game
+            // hasn't initialised the engine fully yet, redline can be 0.
+            if redline <= idle.max(1) {
+                return None;
+            }
+            Some(EngineState {
+                rpm: h.rpm(),
+                rpm_redline: redline,
+                rpm_idle: idle,
             })
         }
         // BeamNG and Assetto Corsa run on dedicated listeners that

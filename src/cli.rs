@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use moza_rev::assetto_corsa;
 use moza_rev::codemasters_legacy;
+use moza_rev::forza;
 use moza_rev::madness;
 use moza_rev::moza::Protocol;
 use moza_rev::outgauge;
@@ -16,6 +17,7 @@ pub const DEFAULT_DR2_PORT: u16 = codemasters_legacy::DEFAULT_PORT; // 20777
 pub const DEFAULT_BEAMNG_PORT: u16 = outgauge::DEFAULT_PORT; // 4444
 pub const DEFAULT_AMS2_PORT: u16 = madness::DEFAULT_PORT; // 5606
 pub const DEFAULT_AC_PORT: u16 = assetto_corsa::DEFAULT_PORT; // 9996
+pub const DEFAULT_FORZA_PORT: u16 = forza::DEFAULT_PORT; // 9999
 pub const DEFAULT_LED_COUNT: usize = 10;
 
 /// drive the Moza wheel's RPM LED bar from game telemetry
@@ -62,6 +64,11 @@ pub struct ListenArgs {
     /// Assetto Corsa 1 UDP port (handshake-based; adaptive redline).
     #[arg(long, default_value_t = DEFAULT_AC_PORT, value_name = "PORT")]
     pub ac_port: u16,
+
+    /// Forza "Data Out" UDP port (FM7 / FH4 / FH5). No game-side default;
+    /// must match the in-game `Settings → HUD and Gameplay → Data Out IP Port`.
+    #[arg(long, default_value_t = DEFAULT_FORZA_PORT, value_name = "PORT")]
+    pub forza_port: u16,
 
     /// Override the autodetected Moza wheelbase serial path.
     #[arg(short, long, value_name = "PATH")]

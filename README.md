@@ -36,6 +36,7 @@ A single `cargo run` opens all per-game telemetry sources simultaneously and rou
 | Assetto Corsa 1 | 9996 | always on ³ | Handshake-based; adaptive redline |
 | Assetto Corsa Competizione | 9000 | ✓ auto | Broadcasting API ⁴ — gear/speed/lap only, **no RPM** |
 | Assetto Corsa Rally | — | flagged | UE5; Kunos hasn't shipped a documented telemetry export yet |
+| Forza Horizon 5 / Horizon 4 / Motorsport 7 | 9999 ⁵ | manual | "Data Out" UDP (Sled / Dash); RPM + redline + idle in-protocol |
 | Wreckfest 1, DIRT 5 | — | flagged | No native UDP — would need [SpaceMonkey](https://github.com/PHARTGAMES/SpaceMonkey) under Wine |
 
 ¹ DiRT 2 / 3, F1 2010-2017, GRID / GRID 2 / GRID Autosport, DiRT Rally 1.0 all share the same UDP format on port 20777 and should work, but haven't been individually verified.
@@ -47,6 +48,8 @@ A single `cargo run` opens all per-game telemetry sources simultaneously and rou
 ³ AC's UDP listener is unconditionally on once a session is loaded — no telemetry toggles. `configure` instead offers to write `steam_appid.txt` next to `acs.exe` to fix the standard Proton launcher workaround (see the **Assetto Corsa** subsection).
 
 ⁴ ACC's broadcasting API is connection-oriented (register/result handshake, password). It carries gear, speed, lap, position, weather — but not engine RPM, so it can't drive the LED bar on its own. `configure` enables broadcasting in `broadcasting.json` and the `assetto_corsa_competizione_log` example exercises the protocol; an RPM-capable ACC bridge would still need a Windows-side shared-memory reader.
+
+⁵ No game-imposed default; we suggest 9999 to match the same value `--forza-port` defaults to. Pick anything free and just keep the in-game port and `--forza-port` aligned.
 
 ## Setup details
 
@@ -88,6 +91,14 @@ Caveat — same as BeamNG: AC's `RTCarInfo` doesn't carry a redline, so moza-rev
 
 Linux launcher caveat: AC's stock launcher (`AssettoCorsa.exe`, .NET WPF + CEF3) often fails on current Wine/Proton with an assembly-load error. The standard workaround is to add `acs.exe` (the actual game binary, in the install root) as a non-Steam shortcut and force a stable Proton on it. That direct launch then needs a `steam_appid.txt` containing `244210` next to `acs.exe`, or `acs.exe` exits ~2 s after start with no error message. `moza-rev configure` offers to write that file.
 
+### Forza Horizon 5 / 4, Forza Motorsport 7
+
+In game: `Settings → HUD and Gameplay → Data Out: On`, set `IP Address: 127.0.0.1`, `IP Port: 9999` (or whatever you pass to `--forza-port`). FH5 has no format selector — it's locked to **Dash** (324 B); FM7's selector lets you pick Sled or Dash, but moza-rev's parser handles either. Settings persist inside Proton's compatdata in a layout we haven't reverse-engineered, so this is in-game only — `moza-rev configure` detects FH5/FH4 and prints the steps but doesn't auto-apply.
+
+No Linux gotchas — Forza sends to a single host:port (not broadcast), so the AMS2 iptables loopback workaround is not needed.
+
+The Forza protocol carries `engine_max_rpm` and `engine_idle_rpm` directly in every packet, so unlike BeamNG and AC1 there's no adaptive-redline learning curve — the LED bar is correctly scaled from the first packet.
+
 ### Assetto Corsa Competizione
 
 ACC's only network-telemetry surface is the **Broadcasting API** — connection-oriented UDP on port 9000 with a password handshake. It's intended for spectator overlays, so it carries gear, speed, lap, position, weather, but **not** engine RPM. moza-rev includes a parser and example, but driving the LED bar from ACC would still need a Windows-side shared-memory bridge for RPM.
@@ -121,6 +132,7 @@ Useful flags:
 --ams2-port   5606       # change AMS2 / PC2 (Madness) UDP port
 --beamng-port 4444       # change BeamNG OutGauge UDP port
 --ac-port     9996       # change Assetto Corsa UDP port
+--forza-port  9999       # change Forza Data Out UDP port
 --serial /dev/ttyACM0    # override the autodetected serial path
 --leds 10                # number of LEDs on the wheel
 --protocol legacy        # force legacy (R3/R5/ES); modern is default
@@ -141,6 +153,7 @@ cargo run --example automobilista_2_log  # one-line summary per AMS2 / PC2 telem
 cargo run --example assetto_corsa_log    # handshake + one-line summary per RTCarInfo packet
 cargo run --example assetto_corsa_competizione_log
                                          # ACC Broadcasting API session + focused-car updates
+cargo run --example forza_log            # Forza Data Out (FM7 / FH4 / FH5)
 ```
 
 ## Logging

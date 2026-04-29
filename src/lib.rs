@@ -2,6 +2,7 @@ pub mod assetto_corsa;
 pub mod assetto_corsa_competizione;
 pub mod codemasters_legacy;
 pub mod configure;
+pub mod forza;
 pub mod madness;
 pub mod moza;
 pub mod outgauge;
