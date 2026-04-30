@@ -139,6 +139,20 @@ Useful flags:
 --verbose                # log every UDP packet's RPM
 ```
 
+## Run as a systemd service
+
+Two helper scripts handle install / uninstall of a system-level systemd unit. The unit runs as your normal user (not root) under group `dialout` so it can open `/dev/ttyACM*` without escalation.
+
+```sh
+./install.sh                    # build release, install binary + service, enable + start
+./uninstall.sh                  # disable, remove unit and binary
+
+systemctl status moza-rev       # check it's up
+journalctl -u moza-rev -f       # follow the log
+```
+
+`install.sh` substitutes the invoking user (`$SUDO_USER`) into `moza-rev.service` at install time, so the source unit stays a template. Re-running with a different user just rewrites the installed unit; no source changes needed.
+
 ## Diagnostic examples
 
 ```sh
