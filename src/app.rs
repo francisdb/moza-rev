@@ -1,60 +1,22 @@
-// Runtime: spawn the per-game UDP listeners, route their EngineState
+// Runtime: spawn the per-game listeners (each in its own
+// `crate::listeners::<game>` module), route their `EngineState`
 // updates to a single channel, and drive the Moza wheel's LED bar +
-// status output from there. Knows nothing about clap — `run` takes a
-// fully-parsed `ListenArgs` from `crate::cli`.
+// status output from there. Knows nothing about clap; `run` takes a
+// fully-parsed `ListenArgs` from `crate::cli`, and nothing about
+// game protocols; that lives in the per-listener modules.
 
 use std::io::{IsTerminal, Write};
-use std::net::UdpSocket;
 use std::process::ExitCode;
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use log::{debug, error, info, warn};
 
-use moza_rev::assetto_corsa::{Handshake, HandshakeResponse, RtCarInfo, op};
-use moza_rev::codemasters_legacy::Telemetry;
-use moza_rev::forza;
-use moza_rev::madness;
+use moza_rev::listeners::{self, EngineState, GameId, Update};
 use moza_rev::moza::{self, BaseTemps, Moza, Protocol};
-use moza_rev::outgauge;
-use moza_rev::wreckfest::{self, EngineState};
 
 use crate::cli::ListenArgs;
 
-/// AMS2 / PC2 don't transmit an idle RPM. Use a typical petrol-car value;
-/// the bar will start lighting slightly above this. Tweak via the constant
-/// if you race diesels or high-revving race cars.
-const AMS2_ASSUMED_IDLE: i32 = 800;
-
-/// OutGauge doesn't ship max-RPM, so we adaptively track the highest
-/// RPM seen in the BeamNG session. Start sane for typical petrol cars
-/// (~7000 redline) so the bar lights up reasonably even before the
-/// driver has revved high.
-const BEAMNG_INITIAL_REDLINE: f32 = 7000.0;
-/// And no idle either. Most petrol engines idle at ~700-900 RPM; below
-/// this we treat as engine off and skip frames.
-const BEAMNG_ASSUMED_IDLE: i32 = 800;
-
-/// Assetto Corsa's RTCarInfo packet has no redline / max-RPM field, so
-/// we adapt like BeamNG does. Start at a typical petrol value.
-const AC_INITIAL_REDLINE: f32 = 7000.0;
-const AC_ASSUMED_IDLE: i32 = 800;
-/// How often to retry the handshake when AC isn't responding (no
-/// session loaded, or AC not running). Keep low enough that startup
-/// order doesn't matter, high enough not to hammer the network.
-const AC_HANDSHAKE_RETRY: Duration = Duration::from_secs(3);
-/// Time to wait for AC's handshake reply before giving up and retrying.
-const AC_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(800);
-/// Time to wait for the next RTCarInfo packet before treating the
-/// session as ended and going back to handshake retry.
-const AC_STREAM_TIMEOUT: Duration = Duration::from_secs(2);
-/// AC's UPDATE subscription fires every physics step (~333 Hz), 3-5x
-/// faster than any other game's telemetry cadence. The wheel only
-/// needs LED updates at the heartbeat rate (~4 Hz nominal, more on
-/// state change), so we cap the forward rate to a sane ~60 Hz to
-/// avoid flooding the channel without dropping LED responsiveness.
-const AC_FORWARD_INTERVAL: Duration = Duration::from_millis(16);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
 const STATUS_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -82,56 +44,6 @@ const MCU_TEMP_WARN_C: f32 = 75.0;
 const MOSFET_TEMP_WARN_C: f32 = 70.0;
 const MOTOR_TEMP_WARN_C: f32 = 95.0;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GameId {
-    Wreckfest2,
-    /// Any Codemasters EGO-engine title using the "extradata" UDP format
-    /// (DiRT 2/3/Showdown, F1 2010-2017, GRID series, DiRT Rally, DR2).
-    CodemastersLegacy,
-    /// BeamNG.drive (also Live For Speed and other LFS-OutGauge-compat
-    /// titles, as long as they target the same UDP port).
-    BeamNG,
-    /// Automobilista 2 / Project CARS 2 (and PC1, PC3) — Madness-engine
-    /// PC2 UDP format.
-    Ams2,
-    /// Assetto Corsa 1 — handshake-based UDP, adaptive redline.
-    AssettoCorsa,
-    /// Forza Data Out (FM7 / FH4 / FH5). RPM, redline and idle are all
-    /// in-protocol so no adaptive tracking is needed.
-    Forza,
-}
-
-impl GameId {
-    /// Compact tag for the per-tick status line (`[WF2]`, `[AC]`, …).
-    fn label(self) -> &'static str {
-        match self {
-            GameId::Wreckfest2 => "WF2",
-            GameId::CodemastersLegacy => "DR2",
-            GameId::BeamNG => "BNG",
-            GameId::Ams2 => "AMS2",
-            GameId::AssettoCorsa => "AC",
-            GameId::Forza => "FZA",
-        }
-    }
-
-    /// Full name for startup / lifecycle log lines.
-    fn name(self) -> &'static str {
-        match self {
-            GameId::Wreckfest2 => "Wreckfest 2",
-            GameId::CodemastersLegacy => "Codemasters EGO (DR2 / DiRT / F1 / GRID)",
-            GameId::BeamNG => "BeamNG.drive",
-            GameId::Ams2 => "Automobilista 2 / Project CARS 2",
-            GameId::AssettoCorsa => "Assetto Corsa",
-            GameId::Forza => "Forza (FM7 / FH4 / FH5)",
-        }
-    }
-}
-
-struct Update {
-    game: GameId,
-    engine: EngineState,
-}
-
 /// Open the Moza wheelbase, honouring an explicit `--serial` if the user
 /// supplied one or autodetecting otherwise. Returns `None` if no wheel is
 /// reachable; the caller chooses whether that's fatal (startup) or just a
@@ -158,8 +70,8 @@ pub fn run(args: ListenArgs) -> ExitCode {
     let user_serial = args.serial.clone();
     let user_protocol = args.protocol.map(Protocol::from);
 
-    // Try to open the wheel once at startup, but don't make it fatal —
-    // a systemd service may launch before the wheel is plugged in. The
+    // Try to open the wheel once at startup, but don't make it fatal: a
+    // systemd service may launch before the wheel is plugged in. The
     // main loop's reconnect cycle picks it up whenever it appears.
     let (mut wheel, mut last_reconnect) = match open_wheel(user_serial.as_deref(), user_protocol) {
         Some((path, protocol, w)) => {
@@ -168,7 +80,7 @@ pub fn run(args: ListenArgs) -> ExitCode {
         }
         None => {
             warn!(
-                "no Moza wheelbase found yet — will keep retrying every {}s. \
+                "no Moza wheelbase found yet; will keep retrying every {}s. \
                  plug it in, or pass --serial /dev/ttyACMx to pin a path",
                 RECONNECT_INTERVAL.as_secs()
             );
@@ -184,22 +96,22 @@ pub fn run(args: ListenArgs) -> ExitCode {
     };
 
     let (tx, rx) = mpsc::channel::<Update>();
-    if !spawn_listener(args.wf2_port, GameId::Wreckfest2, tx.clone()) {
+    if !listeners::wreckfest_2::spawn(args.wf2_port, tx.clone()) {
         return ExitCode::FAILURE;
     }
-    if !spawn_listener(args.dr2_port, GameId::CodemastersLegacy, tx.clone()) {
+    if !listeners::codemasters_legacy::spawn(args.dr2_port, tx.clone()) {
         return ExitCode::FAILURE;
     }
-    if !spawn_listener(args.ams2_port, GameId::Ams2, tx.clone()) {
+    if !listeners::madness::spawn(args.ams2_port, tx.clone()) {
         return ExitCode::FAILURE;
     }
-    if !spawn_beamng_listener(args.beamng_port, tx.clone()) {
+    if !listeners::outgauge::spawn(args.beamng_port, tx.clone()) {
         return ExitCode::FAILURE;
     }
-    if !spawn_listener(args.forza_port, GameId::Forza, tx.clone()) {
+    if !listeners::forza::spawn(args.forza_port, tx.clone()) {
         return ExitCode::FAILURE;
     }
-    spawn_ac_listener(args.ac_port, tx);
+    listeners::assetto_corsa::spawn(args.ac_port, tx);
 
     let led_count = args.leds;
     let verbose = args.verbose;
@@ -219,7 +131,7 @@ pub fn run(args: ListenArgs) -> ExitCode {
 
     loop {
         // Reconnect attempt if the wheel got unplugged. Quiet at debug
-        // until the open succeeds — info-level chatter every 3s would
+        // until the open succeeds; info-level chatter every 3s would
         // be noisy. The transition log is in `open_wheel`'s caller.
         if wheel.is_none() && last_reconnect.elapsed() >= RECONNECT_INTERVAL {
             if let Some((path, _, w)) = open_wheel(user_serial.as_deref(), user_protocol) {
@@ -244,14 +156,18 @@ pub fn run(args: ListenArgs) -> ExitCode {
         // writes 0 to the bar.
         if let Some(t) = last_packet_at
             && t.elapsed() >= IDLE_TIMEOUT
-            && active_game.is_some()
+            && let Some(game) = active_game
         {
-            info!("no telemetry for {:?} — going idle", IDLE_TIMEOUT);
+            info!(
+                "telemetry stream from {} stopped (no packets for {:?})",
+                game.name(),
+                IDLE_TIMEOUT
+            );
             active_game = None;
         }
 
         // Heartbeat keepalive. Always write at least once per
-        // HEARTBEAT_INTERVAL, even with no telemetry — this keeps the
+        // HEARTBEAT_INTERVAL, even with no telemetry: this keeps the
         // bar refreshed AND surfaces a USB unplug as a write error
         // within ~1-2s, which would otherwise go unnoticed in idle mode.
         if last_send.elapsed() >= HEARTBEAT_INTERVAL {
@@ -275,7 +191,7 @@ pub fn run(args: ListenArgs) -> ExitCode {
         };
 
         if active_game != Some(update.game) {
-            info!("active game: {}", update.game.name());
+            info!("telemetry stream from {} started", update.game.name());
             active_game = Some(update.game);
         }
         last_packet_at = Some(Instant::now());
@@ -298,7 +214,12 @@ pub fn run(args: ListenArgs) -> ExitCode {
                 false, // verbose: one line per packet, never overwrite
             );
             packets_since_status = 0;
-        } else if last_status.elapsed() >= STATUS_INTERVAL {
+        } else if inplace_status && last_status.elapsed() >= STATUS_INTERVAL {
+            // Rolling status only when stdout is a real TTY (so the `\r`
+            // overwrite keeps it to one visible line). On systemd /
+            // piped output the connect/disconnect lifecycle lines plus
+            // `--verbose` are the way to see what's happening; flooding
+            // the journal with 2 status lines per second is useless.
             print_status(
                 update.game,
                 &update.engine,
@@ -309,300 +230,6 @@ pub fn run(args: ListenArgs) -> ExitCode {
             );
             last_status = Instant::now();
             packets_since_status = 0;
-        }
-    }
-}
-
-/// Spawn a UDP listener thread for `game` on `port`. Returns true on
-/// successful bind, false if the port couldn't be claimed (caller should
-/// fail-fast in that case).
-fn spawn_listener(port: u16, game: GameId, tx: mpsc::Sender<Update>) -> bool {
-    let bind_addr = format!("0.0.0.0:{port}");
-    let socket = match UdpSocket::bind(&bind_addr) {
-        Ok(s) => s,
-        Err(e) => {
-            error!("bind {} {bind_addr}: {e}", game.label());
-            return false;
-        }
-    };
-    info!(
-        "listening for {} telemetry on udp://{bind_addr}",
-        game.name()
-    );
-    thread::Builder::new()
-        .name(format!("listener-{}", game.label()))
-        .spawn(move || listener_loop(socket, game, tx))
-        .expect("failed to spawn listener thread");
-    true
-}
-
-fn listener_loop(socket: UdpSocket, game: GameId, tx: mpsc::Sender<Update>) {
-    let mut buf = vec![0u8; 2048];
-    loop {
-        let n = match socket.recv(&mut buf) {
-            Ok(n) => n,
-            Err(e) => {
-                error!("{} recv: {e}", game.label());
-                continue;
-            }
-        };
-        let Some(engine) = parse(game, &buf[..n]) else {
-            continue;
-        };
-        if tx.send(Update { game, engine }).is_err() {
-            // Receiver dropped → main has exited.
-            return;
-        }
-    }
-}
-
-fn parse(game: GameId, buf: &[u8]) -> Option<EngineState> {
-    match game {
-        GameId::Wreckfest2 => wreckfest::parse_main(buf),
-        GameId::CodemastersLegacy => {
-            let t = Telemetry::from_bytes(buf)?;
-            // Skip frames before the engine is "real" (in menus, redline=0).
-            if t.redline_rpm() <= t.idle_rpm() {
-                return None;
-            }
-            Some(EngineState {
-                rpm: t.rpm(),
-                rpm_redline: t.redline_rpm(),
-                rpm_idle: t.idle_rpm(),
-            })
-        }
-        GameId::Ams2 => {
-            // Madness engine multiplexes 9 packet types on the same port;
-            // TelemetryPacket::from_bytes filters to type 0 (telemetry).
-            let pkt = madness::TelemetryPacket::from_bytes(buf)?;
-            let redline = pkt.data.redline_rpm();
-            // Skip menu/loading frames where the engine isn't initialized.
-            if redline <= 0 {
-                return None;
-            }
-            Some(EngineState {
-                rpm: pkt.data.rpm(),
-                rpm_redline: redline,
-                rpm_idle: AMS2_ASSUMED_IDLE,
-            })
-        }
-        GameId::Forza => {
-            let h = forza::Header::from_bytes(buf)?;
-            // Skip menu / paused frames where the engine isn't running.
-            if !h.is_race_on() {
-                return None;
-            }
-            let redline = h.redline_rpm();
-            let idle = h.idle_rpm();
-            // Same defensive guard as Codemasters / AMS2: if the game
-            // hasn't initialised the engine fully yet, redline can be 0.
-            if redline <= idle.max(1) {
-                return None;
-            }
-            Some(EngineState {
-                rpm: h.rpm(),
-                rpm_redline: redline,
-                rpm_idle: idle,
-            })
-        }
-        // BeamNG and Assetto Corsa run on dedicated listeners that
-        // maintain adaptive redline state — see `listener_loop_outgauge`
-        // and `listener_loop_ac`.
-        GameId::BeamNG | GameId::AssettoCorsa => None,
-    }
-}
-
-/// BeamNG's OutGauge format gives us current RPM but no redline or idle
-/// values. We track the highest RPM seen in the session and use that as
-/// an adaptive redline; idle is fixed at a typical petrol-car value.
-/// This means the LED bar self-tunes after a few revs of the engine.
-fn spawn_beamng_listener(port: u16, tx: mpsc::Sender<Update>) -> bool {
-    let bind_addr = format!("0.0.0.0:{port}");
-    let socket = match UdpSocket::bind(&bind_addr) {
-        Ok(s) => s,
-        Err(e) => {
-            error!("bind BNG {bind_addr}: {e}");
-            return false;
-        }
-    };
-    info!(
-        "listening for {} telemetry on udp://{bind_addr}",
-        GameId::BeamNG.name()
-    );
-    thread::Builder::new()
-        .name(format!("listener-{}", GameId::BeamNG.label()))
-        .spawn(move || listener_loop_outgauge(socket, tx))
-        .expect("failed to spawn BNG listener thread");
-    true
-}
-
-fn listener_loop_outgauge(socket: UdpSocket, tx: mpsc::Sender<Update>) {
-    let mut max_rpm: f32 = BEAMNG_INITIAL_REDLINE;
-    let mut buf = vec![0u8; 256];
-    loop {
-        let n = match socket.recv(&mut buf) {
-            Ok(n) => n,
-            Err(e) => {
-                error!("BNG recv: {e}");
-                continue;
-            }
-        };
-        let Some(packet) = outgauge::Packet::from_bytes(&buf[..n]) else {
-            continue;
-        };
-        let rpm_f = { packet.rpm };
-        // Skip when engine is off / car not loaded.
-        if rpm_f <= 1.0 {
-            continue;
-        }
-        if rpm_f > max_rpm {
-            max_rpm = rpm_f;
-        }
-        let engine = EngineState {
-            rpm: rpm_f as i32,
-            rpm_redline: max_rpm as i32,
-            rpm_idle: BEAMNG_ASSUMED_IDLE,
-        };
-        if tx
-            .send(Update {
-                game: GameId::BeamNG,
-                engine,
-            })
-            .is_err()
-        {
-            return;
-        }
-    }
-}
-
-/// Assetto Corsa is request-response: the client must send a Handshake
-/// to AC's listener port and receive a HandshakeResponse before AC
-/// streams anything. We retry the handshake periodically so it doesn't
-/// matter whether AC is started before or after moza-rev — whenever a
-/// session loads, this loop will pick it up. RTCarInfo has no redline
-/// field, so we adapt like BeamNG does.
-fn spawn_ac_listener(port: u16, tx: mpsc::Sender<Update>) {
-    let target = format!("127.0.0.1:{port}");
-    info!(
-        "listening for {} telemetry via udp://{target} (handshake retry every {}s)",
-        GameId::AssettoCorsa.name(),
-        AC_HANDSHAKE_RETRY.as_secs()
-    );
-    thread::Builder::new()
-        .name(format!("listener-{}", GameId::AssettoCorsa.label()))
-        .spawn(move || listener_loop_ac(target, tx))
-        .expect("failed to spawn AC listener thread");
-}
-
-fn listener_loop_ac(target: String, tx: mpsc::Sender<Update>) {
-    let mut buf = vec![0u8; 1024];
-    let mut max_rpm: f32 = AC_INITIAL_REDLINE;
-
-    loop {
-        // Fresh socket per cycle so AC sees a new client. The previous
-        // session's ephemeral port may already have a queued Dismiss.
-        let socket = match UdpSocket::bind("0.0.0.0:0") {
-            Ok(s) => s,
-            Err(e) => {
-                error!("AC bind: {e}");
-                thread::sleep(AC_HANDSHAKE_RETRY);
-                continue;
-            }
-        };
-        if let Err(e) = socket.connect(&target) {
-            debug!("AC connect {target}: {e}");
-            thread::sleep(AC_HANDSHAKE_RETRY);
-            continue;
-        }
-        if let Err(e) = socket.set_read_timeout(Some(AC_HANDSHAKE_TIMEOUT)) {
-            error!("AC set_read_timeout: {e}");
-            thread::sleep(AC_HANDSHAKE_RETRY);
-            continue;
-        }
-
-        if let Err(e) = socket.send(&Handshake::new(op::HANDSHAKE).to_bytes()) {
-            debug!("AC send handshake: {e}");
-            thread::sleep(AC_HANDSHAKE_RETRY);
-            continue;
-        }
-        let n = match socket.recv(&mut buf) {
-            Ok(n) => n,
-            Err(_) => {
-                // Most common case: AC not running, or running but no
-                // session loaded. Quiet at debug level — info-level
-                // chatter every 3s would be noisy.
-                debug!("AC handshake: no reply, retrying");
-                thread::sleep(AC_HANDSHAKE_RETRY);
-                continue;
-            }
-        };
-        let Some(hs) = HandshakeResponse::from_bytes(&buf[..n]) else {
-            warn!("AC handshake reply too short ({n} bytes); retrying");
-            thread::sleep(AC_HANDSHAKE_RETRY);
-            continue;
-        };
-        info!(
-            "AC connected: car={:?} track={:?} driver={:?}",
-            hs.car(),
-            hs.track(),
-            hs.driver()
-        );
-
-        if let Err(e) = socket.send(&Handshake::new(op::SUBSCRIBE_UPDATE).to_bytes()) {
-            warn!("AC subscribe: {e}");
-            continue;
-        }
-        if let Err(e) = socket.set_read_timeout(Some(AC_STREAM_TIMEOUT)) {
-            warn!("AC set stream timeout: {e}");
-            continue;
-        }
-
-        // Stream loop. On timeout we treat it as session ended and go
-        // back to handshake retry — covers menu return, quit, etc. We
-        // still receive every packet (so the stream-timeout watchdog
-        // works) but only forward at ~60 Hz to avoid spamming the
-        // channel at AC's full 333 Hz physics rate.
-        let mut last_forwarded = Instant::now()
-            .checked_sub(AC_FORWARD_INTERVAL)
-            .unwrap_or_else(Instant::now);
-        loop {
-            let n = match socket.recv(&mut buf) {
-                Ok(n) => n,
-                Err(_) => {
-                    info!("AC stream timed out; returning to handshake retry");
-                    let _ = socket.send(&Handshake::new(op::DISMISS).to_bytes());
-                    break;
-                }
-            };
-            let Some(p) = RtCarInfo::from_bytes(&buf[..n]) else {
-                continue;
-            };
-            let rpm_f = { p.engine_rpm };
-            // Skip menu / engine-off frames.
-            if rpm_f <= 1.0 {
-                continue;
-            }
-            if rpm_f > max_rpm {
-                max_rpm = rpm_f;
-            }
-            if last_forwarded.elapsed() < AC_FORWARD_INTERVAL {
-                continue;
-            }
-            last_forwarded = Instant::now();
-            let engine = EngineState {
-                rpm: rpm_f as i32,
-                rpm_redline: max_rpm as i32,
-                rpm_idle: AC_ASSUMED_IDLE,
-            };
-            if tx
-                .send(Update {
-                    game: GameId::AssettoCorsa,
-                    engine,
-                })
-                .is_err()
-            {
-                return;
-            }
         }
     }
 }
@@ -749,7 +376,7 @@ mod tests {
 
     #[test]
     fn midband_lights_half() {
-        // (3650 - 800) / (6500 - 800) = 0.5 → 5 of 10 LEDs
+        // (3650 - 800) / (6500 - 800) = 0.5 -> 5 of 10 LEDs
         assert_eq!(rpm_to_bitmask(&engine(3650), 10), 0x1F);
     }
 

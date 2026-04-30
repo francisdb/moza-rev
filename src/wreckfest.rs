@@ -839,32 +839,6 @@ fn read_unaligned<T: Copy>(buf: &[u8]) -> Option<T> {
     Some(unsafe { ptr::read_unaligned(buf.as_ptr() as *const T) })
 }
 
-//
-// BACKWARD-COMPAT API
-//
-
-#[derive(Debug, Clone, Copy)]
-pub struct EngineState {
-    pub rpm: i32,
-    pub rpm_redline: i32,
-    pub rpm_idle: i32,
-}
-
-/// Parse just the engine fields out of a Main packet. Convenience wrapper
-/// around [`parse`] for the original RPM-LED use case.
-pub fn parse_main(buf: &[u8]) -> Option<EngineState> {
-    let main = match parse(buf)? {
-        Packet::Main(m) => m,
-        _ => return None,
-    };
-    let engine = main.car.engine;
-    Some(EngineState {
-        rpm: { engine.rpm },
-        rpm_redline: { engine.rpm_redline },
-        rpm_idle: { engine.rpm_idle },
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -909,26 +883,27 @@ mod tests {
     }
 
     #[test]
-    fn parse_main_returns_none_on_wrong_signature() {
+    fn parse_returns_none_on_wrong_signature() {
         let mut buf = vec![0u8; std::mem::size_of::<Main>()];
         buf[0..4].copy_from_slice(&0xDEADBEEFu32.to_le_bytes());
-        assert!(parse_main(&buf).is_none());
         assert!(parse(&buf).is_none());
     }
 
     #[test]
-    fn parse_main_returns_none_on_wrong_packet_type() {
+    fn parse_returns_none_on_wrong_packet_type_for_main_buf() {
+        // A Main-sized buffer with the right signature but a different
+        // packet_type byte parses as that other type, not as Main.
         let mut buf = vec![0u8; std::mem::size_of::<Main>()];
         buf[0..4].copy_from_slice(&SIGNATURE.to_le_bytes());
         buf[4] = PacketType::ParticipantsTiming as u8;
-        assert!(parse_main(&buf).is_none());
+        let pkt = parse(&buf);
+        assert!(!matches!(pkt, Some(Packet::Main(_))));
     }
 
     #[test]
     fn parse_returns_none_on_short_buffer() {
         let buf = [0u8; 5];
         assert!(parse(&buf).is_none());
-        assert!(parse_main(&buf).is_none());
     }
 
     #[test]
@@ -944,10 +919,14 @@ mod tests {
         buf[redline_off..redline_off + 4].copy_from_slice(&7000i32.to_le_bytes());
         buf[idle_off..idle_off + 4].copy_from_slice(&800i32.to_le_bytes());
 
-        let s = parse_main(&buf).expect("should parse");
-        assert_eq!(s.rpm, 4200);
-        assert_eq!(s.rpm_redline, 7000);
-        assert_eq!(s.rpm_idle, 800);
+        let main = match parse(&buf).expect("should parse") {
+            Packet::Main(m) => m,
+            _ => panic!("expected Main packet"),
+        };
+        let engine = main.car.engine;
+        assert_eq!({ engine.rpm }, 4200);
+        assert_eq!({ engine.rpm_redline }, 7000);
+        assert_eq!({ engine.rpm_idle }, 800);
     }
 
     #[test]
