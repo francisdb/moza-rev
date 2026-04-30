@@ -44,13 +44,7 @@ fn run(socket: UdpSocket, tx: mpsc::Sender<Update>) {
         let Some(engine) = parse(&buf[..n]) else {
             continue;
         };
-        if tx
-            .send(Update {
-                game: GAME,
-                engine,
-            })
-            .is_err()
-        {
+        if tx.send(Update { game: GAME, engine }).is_err() {
             return;
         }
     }

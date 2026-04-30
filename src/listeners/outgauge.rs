@@ -72,13 +72,7 @@ fn run(socket: UdpSocket, tx: mpsc::Sender<Update>) {
             rpm_redline: max_rpm as i32,
             rpm_idle: ASSUMED_IDLE,
         };
-        if tx
-            .send(Update {
-                game: GAME,
-                engine,
-            })
-            .is_err()
-        {
+        if tx.send(Update { game: GAME, engine }).is_err() {
             return;
         }
     }
