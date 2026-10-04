@@ -480,7 +480,8 @@ fn handle_ams2() {
     println!("{}", style::title("Automobilista 2"));
     println!("  Has UDP telemetry on port {port} using the Project CARS 2 format.");
     println!("  In game: Options → System → UDP Protocol Version: Project CARS 2,");
-    println!("                              UDP Frequency: 1+");
+    println!("                              UDP Frequency: 1 (fastest, for responsive LEDs)");
+    println!("  Restart the game after changing these settings.");
     println!("  (Settings live in encrypted .sav files; can't auto-edit.)");
 
     match probe_broadcast_loopback(port) {
@@ -968,8 +969,11 @@ fn decode_utf16_le(bytes: &[u8]) -> Result<String, String> {
         ));
     }
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .copied()
+        .map(u16::from_le_bytes)
         .collect();
     String::from_utf16(&units).map_err(|e| e.to_string())
 }

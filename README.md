@@ -17,8 +17,11 @@ cargo run --release                   # drive the LEDs
 ## Tested devices
 
 - Moza R5 Bundle (R5 base + bundled ES wheel) — confirmed working.
+- Moza R12 + CS V2P — confirmed working with Automobilista 2 (modern protocol).
 
 Other Moza wheelbases should work via the modern protocol path (auto-selected from the USB serial id) but haven't been verified. Reports welcome.
+
+Modern wheels are switched to telemetry mode and receive a green/yellow/red telemetry colour table on the first LED write after connecting. Brightness is left at the wheel's configured value. The colour table is required in addition to the LED bitmask; without it, a wheel can accept commands while its LEDs remain black.
 
 ## Supported games
 
@@ -71,7 +74,7 @@ Caveat: OutGauge doesn't transmit a redline RPM. moza-rev adaptively tracks the 
 
 ### Automobilista 2 / Project CARS 2
 
-In game: `Options → System` — set **UDP Protocol Version: Project CARS 2**, **UDP Frequency: 1+** (lower = higher rate; 5 ≈ 120 Hz is plenty). Restart the game so the setting actually applies. Default port `5606`. Shared Memory mode (a separate setting in the same panel) doesn't need to match — UDP works regardless of what it's set to.
+In game: `Options → System` — set **UDP Protocol Version: Project CARS 2**, **UDP Frequency: 1** for responsive rev lights (lower numbers send more often; 9 produced only one RPM update per second in an AMS2 capture). Restart the game so the setting actually applies. Default port `5606`. Shared Memory mode (a separate setting in the same panel) doesn't need to match — UDP works regardless of what it's set to.
 
 **Linux gotcha — broadcast loopback.** AMS2 sends to the limited-broadcast address `255.255.255.255:5606`. Linux emits this packet out the routing-default interface (e.g. `enp0s…`) but does **not** loop it back to local sockets, so `cargo run --example automobilista_2_log` sees nothing despite `tcpdump -i any` clearly showing traffic on the `Out` direction. Workaround — redirect the broadcast back to localhost:
 

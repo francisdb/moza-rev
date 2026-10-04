@@ -64,6 +64,29 @@ fn main() -> ExitCode {
     let deadline = Duration::from_millis(800);
 
     println!();
+    if protocol == Protocol::Modern {
+        read_one(
+            &mut wheel,
+            "telemetry-mode",
+            &[0x1C, 0x00],
+            1,
+            deadline,
+            |v| match v {
+                0 => "Off".to_string(),
+                1 => "Telemetry".to_string(),
+                2 => "Static".to_string(),
+                other => format!("unknown ({other})"),
+            },
+        );
+        read_one(
+            &mut wheel,
+            "rpm-brightness (modern)",
+            &[0x1B, 0x00, 0xFF],
+            1,
+            deadline,
+            |v| format!("{v} / 100"),
+        );
+    }
     read_one(
         &mut wheel,
         "rpm-indicator-mode",

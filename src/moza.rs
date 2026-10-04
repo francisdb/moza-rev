@@ -91,6 +91,7 @@ pub fn detect_protocol(serial_path: &str) -> Protocol {
 pub struct Moza {
     port: Box<dyn serialport::SerialPort>,
     protocol: Protocol,
+    initialized_led_count: Option<usize>,
 }
 
 impl Moza {
@@ -119,7 +120,11 @@ impl Moza {
             .exclusive(false)
             .open()
             .map_err(|e| io::Error::other(format!("open {path}: {e}")))?;
-        let mut moza = Self { port, protocol };
+        let mut moza = Self {
+            port,
+            protocol,
+            initialized_led_count: None,
+        };
         let _ = moza.port.clear(serialport::ClearBuffer::All);
 
         if protocol == Protocol::Legacy {
@@ -174,7 +179,23 @@ impl Moza {
     }
 
     pub fn send_rpm_bitmask(&mut self, bitmask: u32, led_count: usize) -> io::Result<()> {
+        if !(1..=32).contains(&led_count) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "LED count must be between 1 and 32",
+            ));
+        }
         let dev = self.device_id();
+        if self.protocol == Protocol::Modern && self.initialized_led_count != Some(led_count) {
+            // The bitmask alone is insufficient: modern wheels also need
+            // external telemetry mode and a non-black telemetry colour table.
+            // These are the same commands used by Boxflat's RPM test. The
+            // telemetry palette is separate from the wheel's static colours.
+            for frame in build_modern_rpm_setup_frames(dev, led_count) {
+                self.write_frame(&frame)?;
+            }
+            self.initialized_led_count = Some(led_count);
+        }
         let frame = match self.protocol {
             Protocol::Modern => build_modern_rpm_frame(dev, bitmask, led_count),
             Protocol::Legacy => build_legacy_rpm_frame(dev, bitmask),
@@ -224,7 +245,13 @@ impl Moza {
         response_payload_len: usize,
         deadline: Duration,
     ) -> io::Result<Option<Vec<u8>>> {
-        let request_payload = vec![0u8; response_payload_len];
+        // Boxflat reads settings with an integer value of 1, encoded in
+        // big-endian form across the setting's payload width. Zero-valued
+        // requests are ignored by some firmware.
+        let mut request_payload = vec![0u8; response_payload_len];
+        if let Some(last) = request_payload.last_mut() {
+            *last = 1;
+        }
         let dev = self.device_id();
         self.write_frame(&build_frame(read_group, dev, cmd_id, &request_payload))?;
         let want_group = read_group | 0x80;
@@ -372,6 +399,35 @@ fn build_modern_rpm_frame(device: u8, bitmask: u32, led_count: usize) -> Vec<u8>
     build_frame(GROUP_WHEEL_WRITE, device, &[0x1A, 0x00], &payload)
 }
 
+fn build_modern_rpm_setup_frames(device: u8, led_count: usize) -> Vec<Vec<u8>> {
+    let mut frames = vec![build_frame(GROUP_WHEEL_WRITE, device, &[0x1C, 0x00], &[1])];
+    // Each colour message contains five [LED index, R, G, B] records.
+    // Repeat the final record to fill the last message on bars whose LED
+    // count is not a multiple of five, without addressing nonexistent LEDs.
+    for start in (0..led_count).step_by(5) {
+        let mut payload = Vec::with_capacity(20);
+        for offset in 0..5 {
+            let index = (start + offset).min(led_count - 1);
+            let colour = if index * 10 < led_count * 5 {
+                [0, 255, 0]
+            } else if index * 10 < led_count * 8 {
+                [255, 180, 0]
+            } else {
+                [255, 0, 0]
+            };
+            payload.push(index as u8);
+            payload.extend_from_slice(&colour);
+        }
+        frames.push(build_frame(
+            GROUP_WHEEL_WRITE,
+            device,
+            &[0x19, 0x00],
+            &payload,
+        ));
+    }
+    frames
+}
+
 fn build_legacy_rpm_frame(device: u8, value: u32) -> Vec<u8> {
     // ES wheels: 4-byte big-endian RPM value (0..1023 in Percent mode), not
     // a literal LED bitmask — wheel firmware maps it to LEDs via thresholds.
@@ -440,6 +496,64 @@ fn byte_stuff(frame: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn setting_read_sends_the_firmware_read_marker() {
+        use serialport::SerialPort;
+
+        let (mut peer, mut port) = serialport::TTYPort::pair().unwrap();
+        peer.set_timeout(Duration::from_secs(1)).unwrap();
+        port.set_timeout(Duration::from_secs(1)).unwrap();
+        let responder = std::thread::spawn(move || {
+            let mut request = [0; 8];
+            peer.read_exact(&mut request).unwrap();
+            assert_eq!(request, [0x7E, 0x03, 0x40, 0x17, 0x1C, 0x00, 0x01, 0x02]);
+            // Telemetry-mode response captured from the R12 + CS V2P.
+            peer.write_all(&[0x7E, 0x03, 0xC0, 0x71, 0x1C, 0x00, 0x01, 0xDC])
+                .unwrap();
+            // Keep the peer open until the reply has been consumed.
+            peer
+        });
+        let mut wheel = Moza {
+            port: Box::new(port),
+            protocol: Protocol::Modern,
+            initialized_led_count: None,
+        };
+        let reply = wheel
+            .read_setting(GROUP_WHEEL_READ, &[0x1C, 0x00], 1, Duration::from_secs(1))
+            .unwrap();
+        let _peer = responder.join().unwrap();
+        assert_eq!(reply, Some(vec![1]));
+    }
+
+    #[test]
+    fn modern_setup_enables_telemetry_and_loads_all_ten_colours() {
+        let frames = build_modern_rpm_setup_frames(DEVICE_WHEEL, 10);
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[0], [0x7E, 0x03, 0x3F, 0x17, 0x1C, 0x00, 0x01, 0x01]);
+        for (batch, frame) in frames[1..].iter().enumerate() {
+            assert_eq!(&frame[..6], &[0x7E, 0x16, 0x3F, 0x17, 0x19, 0x00]);
+            assert_eq!(frame.len(), 27);
+            for (offset, record) in frame[6..26].as_chunks::<4>().0.iter().enumerate() {
+                assert_eq!(record[0] as usize, batch * 5 + offset);
+                assert!(record[1..].iter().any(|&v| v != 0));
+            }
+        }
+        assert_eq!(&frames[1][6..10], &[0, 0, 255, 0]);
+        assert_eq!(&frames[2][6..10], &[5, 255, 180, 0]);
+        assert_eq!(&frames[2][22..26], &[9, 255, 0, 0]);
+    }
+
+    #[test]
+    fn modern_setup_pads_partial_colour_batch_with_last_led() {
+        let frames = build_modern_rpm_setup_frames(DEVICE_WHEEL, 18);
+        assert_eq!(frames.len(), 5);
+        let last = &frames[4];
+        assert_eq!(&last[14..18], &[17, 255, 0, 0]);
+        assert_eq!(&last[18..22], &last[14..18]);
+        assert_eq!(&last[22..26], &last[14..18]);
+    }
 
     #[test]
     fn modern_rpm_frame_no_leds_lit() {
