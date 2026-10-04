@@ -78,6 +78,14 @@ pub struct ListenArgs {
     #[arg(short, long, default_value_t = DEFAULT_LED_COUNT, value_name = "N")]
     pub leds: usize,
 
+    /// Redline percentage at which the first RPM LED lights.
+    #[arg(long, default_value_t = 80, value_name = "PERCENT", value_parser = clap::value_parser!(u8).range(0..100))]
+    pub rpm_start_percent: u8,
+
+    /// Redline percentage at which all RPM LEDs light (must exceed the start).
+    #[arg(long, default_value_t = 97, value_name = "PERCENT", value_parser = clap::value_parser!(u8).range(1..=100))]
+    pub rpm_full_percent: u8,
+
     /// Force a specific Moza wire protocol (default: autodetected from USB id).
     #[arg(long, value_enum, value_name = "PROTOCOL")]
     pub protocol: Option<ProtocolArg>,

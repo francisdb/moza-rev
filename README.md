@@ -124,6 +124,8 @@ cargo run --example assetto_corsa_competizione_log
 cargo run --release
 ```
 
+The LEDs act as shift lights: the first lights at **80% of redline**, and the full bar lights at **97%**, with the intervening LEDs evenly spaced. Percentages are relative to the game's redline, not the idle-to-redline span. These are general starting thresholds; the best shift point depends on the car. For an earlier indication, use `--rpm-start-percent 70`; for a full bar only at redline, use `--rpm-full-percent 100`.
+
 Useful flags:
 
 ```sh
@@ -135,6 +137,8 @@ Useful flags:
 --forza-port  9999       # change Forza Data Out UDP port
 --serial /dev/ttyACM0    # override the autodetected serial path
 --leds 10                # number of LEDs on the wheel
+--rpm-start-percent 80    # first LED threshold (% of redline)
+--rpm-full-percent 97     # full bar threshold (% of redline; greater than start)
 --protocol legacy        # force legacy (R3/R5/ES); modern is default
 --verbose                # log every UDP packet's RPM
 ```

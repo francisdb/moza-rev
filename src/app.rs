@@ -67,6 +67,14 @@ fn open_wheel(
 }
 
 pub fn run(args: ListenArgs) -> ExitCode {
+    if args.rpm_start_percent >= args.rpm_full_percent {
+        error!("--rpm-start-percent must be less than --rpm-full-percent");
+        return ExitCode::FAILURE;
+    }
+    info!(
+        "RPM LEDs: first at {}%, full bar at {}% of redline",
+        args.rpm_start_percent, args.rpm_full_percent
+    );
     let user_serial = args.serial.clone();
     let user_protocol = args.protocol.map(Protocol::from);
 
@@ -197,7 +205,12 @@ pub fn run(args: ListenArgs) -> ExitCode {
         last_packet_at = Some(Instant::now());
         packets_since_status += 1;
 
-        let bitmask = rpm_to_bitmask(&update.engine, led_count);
+        let bitmask = rpm_to_bitmask(
+            &update.engine,
+            led_count,
+            args.rpm_start_percent,
+            args.rpm_full_percent,
+        );
         if Some(bitmask) != last_bitmask {
             wheel = try_write(wheel.take(), bitmask, led_count, &mut last_reconnect);
             last_bitmask = Some(bitmask);
@@ -329,18 +342,31 @@ fn led_bar(bitmask: u32, led_count: usize) -> String {
         .collect()
 }
 
-fn rpm_to_bitmask(engine: &EngineState, led_count: usize) -> u32 {
-    if engine.rpm_redline <= engine.rpm_idle || led_count == 0 {
+fn rpm_to_bitmask(
+    engine: &EngineState,
+    led_count: usize,
+    start_percent: u8,
+    full_percent: u8,
+) -> u32 {
+    if engine.rpm_redline <= engine.rpm_idle
+        || engine.rpm <= 0
+        || led_count == 0
+        || start_percent >= full_percent
+    {
         return 0;
     }
-    let span = (engine.rpm_redline - engine.rpm_idle) as f32;
-    let above_idle = (engine.rpm - engine.rpm_idle).max(0) as f32;
-    let frac = (above_idle / span).clamp(0.0, 1.0);
-    let lit = (frac * led_count as f32).round() as usize;
-    let lit = lit.min(led_count);
-    if lit == 0 {
-        0
-    } else if lit >= 32 {
+    // Use percentages of redline, without subtracting idle RPM. Integer
+    // arithmetic keeps the first and last LED thresholds exact. Spread
+    // the intervening LEDs evenly across the configured shift-light range.
+    let rpm = i64::from(engine.rpm) * 100;
+    let start = i64::from(engine.rpm_redline) * i64::from(start_percent);
+    let full = i64::from(engine.rpm_redline) * i64::from(full_percent);
+    if rpm < start {
+        return 0;
+    }
+    let led_count = led_count.min(32);
+    let lit = 1 + ((rpm.min(full) - start) * (led_count - 1) as i64 / (full - start));
+    if lit >= 32 {
         u32::MAX
     } else {
         (1u32 << lit) - 1
@@ -361,23 +387,50 @@ mod tests {
 
     #[test]
     fn below_idle_lights_nothing() {
-        assert_eq!(rpm_to_bitmask(&engine(500), 10), 0);
+        assert_eq!(rpm_to_bitmask(&engine(500), 10, 80, 97), 0);
+    }
+
+    #[test]
+    fn first_led_lights_at_eighty_percent_of_redline() {
+        assert_eq!(rpm_to_bitmask(&engine(5199), 10, 80, 97), 0);
+        assert_eq!(rpm_to_bitmask(&engine(5200), 10, 80, 97), 1);
+    }
+
+    #[test]
+    fn last_led_lights_at_ninety_seven_percent_of_redline() {
+        assert_eq!(rpm_to_bitmask(&engine(6304), 10, 80, 97), 0x1FF);
+        assert_eq!(rpm_to_bitmask(&engine(6305), 10, 80, 97), 0x3FF);
     }
 
     #[test]
     fn at_redline_lights_everything() {
-        assert_eq!(rpm_to_bitmask(&engine(6500), 10), 0x3FF);
+        assert_eq!(rpm_to_bitmask(&engine(6500), 10, 80, 97), 0x3FF);
     }
 
     #[test]
     fn above_redline_clamps() {
-        assert_eq!(rpm_to_bitmask(&engine(9000), 10), 0x3FF);
+        assert_eq!(rpm_to_bitmask(&engine(9000), 10, 80, 97), 0x3FF);
     }
 
     #[test]
     fn midband_lights_half() {
-        // (3650 - 800) / (6500 - 800) = 0.5 -> 5 of 10 LEDs
-        assert_eq!(rpm_to_bitmask(&engine(3650), 10), 0x1F);
+        // 5753 RPM is halfway between 80% (5200) and 97% (6305).
+        assert_eq!(rpm_to_bitmask(&engine(5753), 10, 80, 97), 0x1F);
+    }
+
+    #[test]
+    fn custom_range_uses_requested_thresholds() {
+        assert_eq!(rpm_to_bitmask(&engine(4549), 10, 70, 100), 0);
+        assert_eq!(rpm_to_bitmask(&engine(4550), 10, 70, 100), 1);
+        assert_eq!(rpm_to_bitmask(&engine(6499), 10, 70, 100), 0x1FF);
+        assert_eq!(rpm_to_bitmask(&engine(6500), 10, 70, 100), 0x3FF);
+    }
+
+    #[test]
+    fn handles_single_and_full_width_bars() {
+        assert_eq!(rpm_to_bitmask(&engine(5200), 1, 80, 97), 1);
+        assert_eq!(rpm_to_bitmask(&engine(6500), 32, 80, 97), u32::MAX);
+        assert_eq!(rpm_to_bitmask(&engine(6500), 0, 80, 97), 0);
     }
 
     #[test]
@@ -387,6 +440,8 @@ mod tests {
             rpm_redline: 0,
             rpm_idle: 0,
         };
-        assert_eq!(rpm_to_bitmask(&zero, 10), 0);
+        assert_eq!(rpm_to_bitmask(&zero, 10, 80, 97), 0);
+        assert_eq!(rpm_to_bitmask(&engine(6000), 10, 97, 80), 0);
+        assert_eq!(rpm_to_bitmask(&engine(6000), 10, 80, 80), 0);
     }
 }
