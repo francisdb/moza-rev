@@ -1,0 +1,55 @@
+schema: 1
+tool:
+  version: '0.8.1'
+  nfpm: '2.47.0'
+version_file: Cargo.toml
+nfpm:
+  name: moza-rev
+  maintainer: Francis De Brabandere <francisdb@gmail.com>
+  description: Drive Moza Racing wheel RPM LEDs from game telemetry on Linux
+  homepage: https://github.com/francisdb/moza-rev
+  license: MIT
+  contents:
+    - src: '@PAYLOAD@/moza-rev'
+      dst: /usr/bin/moza-rev
+      file_info:
+        mode: 0755
+    - src: packaging/moza-rev.service
+      dst: /usr/lib/systemd/user/moza-rev.service
+      file_info:
+        mode: 0644
+    - src: LICENSE
+      dst: /usr/share/licenses/moza-rev/LICENSE
+      file_info:
+        mode: 0644
+    - src: README.md
+      dst: /usr/share/doc/moza-rev/README.md
+      file_info:
+        mode: 0644
+  overrides:
+    archlinux:
+      depends: [glibc, gcc-libs, systemd-libs]
+libraries:
+  libudev.so.1:
+    deb: libudev1
+    rpm: systemd-libs
+targets:
+  linux-amd64:
+    platform: linux
+    arch: amd64
+    libc: glibc
+    formats: [deb, rpm, archlinux]
+    input:
+      kind: file
+      local: dist/linux-amd64/moza-rev
+  linux-arm64:
+    platform: linux
+    arch: arm64
+    libc: glibc
+    formats: [deb, rpm]
+    input:
+      kind: file
+      local: dist/linux-arm64/moza-rev
+release:
+  repository: francisdb/moza-rev
+  checksums: checksums.txt

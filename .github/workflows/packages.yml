@@ -1,0 +1,116 @@
+name: Native packages
+
+on:
+  push:
+    paths: [Cargo.toml, Cargo.lock, src/**, native-packages.yaml, packaging/**, README.md, LICENSE, .github/workflows/packages.yml]
+  pull_request:
+    paths: [Cargo.toml, Cargo.lock, src/**, native-packages.yaml, packaging/**, README.md, LICENSE, .github/workflows/packages.yml]
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  packages:
+    if: github.event_name != 'release' || !github.event.release.prerelease
+    name: Packages (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            arch: amd64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8 # v1
+        with:
+          ruby-version: '3.4'
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.26.4'
+          cache: false
+      - name: Install build and packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev pkg-config libarchive-tools binutils xz-utils
+          gem install native-packages --version 0.8.1 --no-document
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.47.0
+      - name: Read version and reproducible build timestamp
+        id: metadata
+        run: |
+          python3 - <<'PY'
+          import os, tomllib
+          with open('Cargo.toml', 'rb') as manifest:
+              version = tomllib.load(manifest)['package']['version']
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              print(f'version={version}', file=output)
+          PY
+          echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
+      - name: Check release tag matches Cargo.toml
+        if: github.event_name == 'release'
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: native-packages check-version "$RELEASE_TAG"
+      - name: Build executable
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: bash packaging/build.sh "$ARCH"
+      - name: Build packages
+        env:
+          ARCH: ${{ matrix.arch }}
+          VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          native-packages validate
+          native-packages doctor --target "linux-$ARCH"
+          native-packages build --version "$VERSION" --target "linux-$ARCH" --output dist/packages
+      - name: Check installation and removal
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          for image in ubuntu:24.04 debian:13-slim fedora:latest; do
+            bash packaging/test-install.sh "$image" dist/packages "$ARCH"
+          done
+          if [[ "$ARCH" == amd64 ]]; then
+            bash packaging/test-install.sh archlinux/archlinux:latest dist/packages "$ARCH"
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: packages-linux-${{ matrix.arch }}
+          path: dist/packages/
+          include-hidden-files: true
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'release' && !github.event.release.prerelease && github.repository == 'francisdb/moza-rev'
+    needs: packages
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+      - uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8 # v1
+        with:
+          ruby-version: '3.4'
+      - run: gem install native-packages --version 0.8.1 --no-document
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: packages-linux-*
+          path: dist/builds
+      - name: Combine verified packages and attach them to the published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          native-packages aggregate dist/builds/packages-linux-* --output dist/complete
+          native-packages publish --from dist/complete --to github

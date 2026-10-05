@@ -2,6 +2,47 @@
 
 Drive a Moza Racing wheel's RPM LED bar from game telemetry. Linux-native, no SimHub required.
 
+## Native packages
+
+The packaging workflow builds DEB and RPM packages for x86-64 and ARM64, plus
+an Arch Linux package for x86-64. Stable GitHub releases receive the packages
+and SHA-256 checksums after installation tests pass. Pull requests and manual
+workflow runs provide downloadable Actions artifacts without publishing a release.
+CI builds on Ubuntu 24.04 and tests installation on Ubuntu 24.04, Debian 13,
+Fedora, and Arch (x86-64 only). Older distributions may not meet the recorded
+glibc requirement.
+
+Download the package matching your distribution and architecture from
+[Releases](https://github.com/francisdb/moza-rev/releases), then install it with
+your package manager:
+
+```sh
+sudo apt install ./moza-rev*.deb          # Debian / Ubuntu
+sudo dnf install ./moza-rev*.rpm          # Fedora
+sudo pacman -U ./moza-rev*.pkg.tar.zst    # Arch Linux
+```
+
+Packages include `/usr/bin/moza-rev` and an optional **user service**. Run
+`moza-rev configure` to set up game telemetry, then run `moza-rev` in a terminal,
+or enable it for your login:
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now moza-rev
+journalctl --user -u moza-rev -f
+```
+
+Serial-device access is still required: join `dialout` on Debian/Fedora or
+`uucp` on Arch, then log out and back in (see [Prerequisites](#prerequisites)).
+The package does not change group membership, firewall rules, or game settings,
+and installation does not start the service automatically. AMS2 still needs the
+[broadcast-loopback setup](#automobilista-2--project-cars-2).
+When moving from `install.sh`, run `./uninstall.sh` first to remove the old
+system service and `/usr/local/bin` binary before enabling the user service.
+
+Packaging uses [native-packages](https://github.com/crmne/native-packages).
+See [packaging/README.md](packaging/README.md) for local builds and release details.
+
 ## Quick start
 
 ```sh

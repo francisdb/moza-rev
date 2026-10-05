@@ -1,0 +1,12 @@
+[Unit]
+Description=Moza wheel RPM LEDs from game telemetry
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/moza-rev
+KillSignal=SIGINT
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
